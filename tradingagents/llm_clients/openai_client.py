@@ -75,6 +75,19 @@ class DeepSeekChatOpenAI(NormalizedChatOpenAI):
             reasoning = message.additional_kwargs.get("reasoning_content")
             if reasoning is not None:
                 message_dict["reasoning_content"] = reasoning
+
+        # DeepSeek V4 quirk: deepseek-v4-flash routes to thinking mode by
+        # default, which rejects ``tool_choice`` ("deepseek-reasoner does
+        # not support this tool_choice"). Analysts need tool_choice, so
+        # we explicitly disable thinking on v4-flash. v4-pro is used for
+        # synthesizers (no tool binding) — leave its default mode alone.
+        # ``thinking`` is a DeepSeek-specific extension; the openai SDK
+        # rejects unknown top-level kwargs, so route it through
+        # extra_body which the SDK passes through verbatim.
+        if self.model_name == "deepseek-v4-flash":
+            extra = payload.setdefault("extra_body", {})
+            if "thinking" not in extra:
+                extra["thinking"] = {"type": "disabled"}
         return payload
 
     def _create_chat_result(self, response, generation_info=None):
@@ -95,11 +108,17 @@ class DeepSeekChatOpenAI(NormalizedChatOpenAI):
         return chat_result
 
     def with_structured_output(self, schema, *, method=None, **kwargs):
-        if self.model_name == "deepseek-reasoner":
+        # Models in DeepSeek's *thinking* mode reject tool_choice="required",
+        # which is what function-calling structured output relies on. The
+        # deprecated deepseek-reasoner is one such model; deepseek-v4-pro
+        # behaves the same way at the V4 endpoint. v4-flash is allowed here
+        # because we explicitly disable its thinking mode in
+        # ``_get_request_payload`` so tool_choice works.
+        if self.model_name in ("deepseek-reasoner", "deepseek-v4-pro"):
             raise NotImplementedError(
-                "deepseek-reasoner does not support tool_choice; structured "
-                "output is unavailable. Agent factories fall back to "
-                "free-text generation automatically."
+                f"{self.model_name} runs in thinking mode and does not support "
+                f"tool_choice; structured output is unavailable. Agent factories "
+                f"fall back to free-text generation automatically."
             )
         return super().with_structured_output(schema, method=method, **kwargs)
 
