@@ -188,6 +188,30 @@ class OpenAIClient(BaseLLMClient):
         if self.provider == "openai":
             llm_kwargs["use_responses_api"] = True
 
+        # Default request timeout + retry policy. langchain-openai's
+        # ChatOpenAI defaults to no timeout — DeepSeek thinking-mode calls
+        # at reasoning_effort=high have been observed to hang indefinitely
+        # on a small fraction of requests. A 4-minute timeout aborts the
+        # stuck call so the agent can retry or surface an error instead
+        # of blocking the run forever.
+        if "timeout" not in llm_kwargs:
+            default_timeout = 240.0
+            if self.provider == "deepseek":
+                # Allow override via env for users who run extremely
+                # complex prompts.
+                try:
+                    default_timeout = float(os.environ.get(
+                        "DEEPSEEK_REQUEST_TIMEOUT_SEC", "240",
+                    ))
+                except (TypeError, ValueError):
+                    default_timeout = 240.0
+            llm_kwargs["timeout"] = default_timeout
+        if "max_retries" not in llm_kwargs:
+            # 1 retry after timeout — better than 0 (single failure
+            # kills the run) and better than the SDK default of 2 (which
+            # turns a 4-min hang into 12 min of wasted wait).
+            llm_kwargs["max_retries"] = 1
+
         # DeepSeek's thinking-mode quirks live in their own subclass so the
         # base NormalizedChatOpenAI stays free of provider-specific branches.
         chat_cls = DeepSeekChatOpenAI if self.provider == "deepseek" else NormalizedChatOpenAI

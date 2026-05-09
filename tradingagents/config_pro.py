@@ -133,6 +133,13 @@ def build_config() -> dict:
     }
 
     # Scorecard layer config — consumed by scorecard/scorers.py + ranker.py.
+    # Per-theme parallelism: DeepSeek V4 has generous rate limits (8000
+    # tokens/sec on Pro, 16000 on Flash) so 4-5 concurrent symbol pipelines
+    # is the sweet spot. Set to 1 if you hit provider rate limits.
+    try:
+        theme_concurrency = int(os.environ.get("THEME_CONCURRENCY", "5"))
+    except (TypeError, ValueError):
+        theme_concurrency = 5
     cfg["scorecard"] = {
         "weights": {
             "mtf_setup":         0.40,
@@ -140,6 +147,6 @@ def build_config() -> dict:
             "thesis_fit":        0.30,
         },
         "min_conviction_for_trade": 3,   # 1–5 scale enforced by scorer prompt
-        "concurrency_per_theme":   1,    # 1 by default — DeepSeek + provider rate limits dominate
+        "concurrency_per_theme":   theme_concurrency,
     }
     return cfg
