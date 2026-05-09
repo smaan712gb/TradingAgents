@@ -116,7 +116,10 @@ class AsyncHttpClient:
                 initial=self.cfg.retry_min_wait_s,
                 max=self.cfg.retry_max_wait_s,
             ),
-            retry=retry_if_exception_type((RateLimitError, httpx.ConnectError, httpx.ReadTimeout)),
+            # Don't retry on RateLimitError — caller should fall back to a
+            # different provider instead of hammering this one. Connect/read
+            # errors are transient network issues and worth retrying.
+            retry=retry_if_exception_type((httpx.ConnectError, httpx.ReadTimeout)),
             before_sleep=before_sleep_log(logger, logging.WARNING),
             reraise=True,
         )
