@@ -68,8 +68,16 @@ class IbkrProvider:
         self.port = int(port or os.getenv("IBKR_PORT", "7497"))   # 7497 = TWS paper
         self.client_id = int(client_id or os.getenv("IBKR_CLIENT_ID", "11"))
         self.account_mode = (account_mode or os.getenv("IBKR_MODE", "paper")).lower()
-        if self.account_mode != "paper":
-            raise LiveTradingDisabledError()
+        if self.account_mode not in ("paper", "live"):
+            raise ValueError(
+                f"IBKR_MODE={self.account_mode!r}: must be 'paper' or 'live'"
+            )
+        if self.account_mode == "live":
+            logger.warning(
+                "IbkrProvider initialized in LIVE mode "
+                "(host=%s port=%s cid=%s) — real-money execution path",
+                self.host, self.port, self.client_id,
+            )
         try:
             from ib_insync import IB  # type: ignore
         except ImportError as e:  # pragma: no cover
@@ -135,10 +143,30 @@ class IbkrProvider:
                 self._reconnect_attempts += 1
                 raise AuthError("ibkr")
             acct = accounts[0]
-            if not acct.startswith("D"):
+            # Account-mode + account-id consistency check. IBKR paper
+            # accounts start with 'D' and live accounts start with 'U'.
+            # Mismatch (paper mode + U-prefix or live mode + D-prefix)
+            # is operator error — bail to prevent unexpected behavior.
+            if self.account_mode == "paper" and not acct.startswith("D"):
                 try: ib.disconnect()
                 except Exception: pass
-                raise LiveTradingDisabledError()
+                raise ProviderError(
+                    "ibkr",
+                    f"IBKR_MODE=paper but connected account {acct!r} doesn't "
+                    f"start with 'D' (paper accounts use D-prefix). Connect "
+                    f"to Gateway in paper mode (port 4002) or set IBKR_MODE=live.",
+                    retryable=False,
+                )
+            if self.account_mode == "live" and not acct.startswith("U"):
+                try: ib.disconnect()
+                except Exception: pass
+                raise ProviderError(
+                    "ibkr",
+                    f"IBKR_MODE=live but connected account {acct!r} doesn't "
+                    f"start with 'U' (live accounts use U-prefix). Connect "
+                    f"to Gateway in live mode (port 4001) or set IBKR_MODE=paper.",
+                    retryable=False,
+                )
 
             # Wire a disconnect listener so the next call notices and reconnects.
             try:
@@ -476,6 +504,90 @@ class IbkrProvider:
             "auction_volume": auction_volume,
         }
 
+    async def get_atm_call_iv(
+        self, *, symbol: str, target_dte: int = 30,
+        timeout_s: float = 4.0,
+    ) -> dict[str, Any]:
+        """Front-month ATM call implied volatility.
+
+        Picks the listed expiration whose DTE is closest to ``target_dte``
+        (default 30 days), then the strike closest to current spot, then
+        reads the option's implied vol via tick 106 (modelGreeks).
+
+        Returns:
+            {
+                "iv": float | None,         # implied volatility (decimal, e.g. 0.45)
+                "strike": float | None,
+                "expiry": str | None,       # YYYYMMDD
+                "dte": int | None,
+                "spot": float | None,
+            }
+
+        Used by the IV-percentile signal in momentum_exhaustion.
+        Markets-closed sessions return cached IV from modelGreeks.optPrice
+        when available, None otherwise.
+        """
+        from datetime import date as _date
+        out: dict[str, Any] = {
+            "iv": None, "strike": None, "expiry": None,
+            "dte": None, "spot": None,
+        }
+
+        try:
+            chain = await self.get_option_chain(symbol=symbol)
+        except Exception as e:
+            logger.warning("ATM IV: chain fetch failed for %s: %s", symbol, e)
+            return out
+
+        expirations: list[str] = chain.get("expirations") or []
+        strikes: list[float] = chain.get("strikes") or []
+        if not expirations or not strikes:
+            return out
+
+        today = _date.today()
+        def _dte_of(exp: str) -> int:
+            try:
+                ed = _date(int(exp[:4]), int(exp[4:6]), int(exp[6:8]))
+                return (ed - today).days
+            except Exception:
+                return 99999
+        expirations_with_dte = [(e, _dte_of(e)) for e in expirations]
+        # Filter out expired contracts (negative DTE)
+        future = [(e, d) for e, d in expirations_with_dte if d > 0]
+        if not future:
+            return out
+        # Pick the closest DTE to target
+        target_exp, target_dte_actual = min(future, key=lambda ed: abs(ed[1] - target_dte))
+
+        # Spot for ATM strike pick
+        try:
+            from tradingagents.strategies.pmcc import _fetch_spot
+            spot = await _fetch_spot(self, symbol)
+        except Exception:
+            spot = None
+        if not spot or spot <= 0:
+            return out
+
+        atm_strike = min(strikes, key=lambda s: abs(s - spot))
+        out["spot"] = spot
+        out["strike"] = atm_strike
+        out["expiry"] = target_exp
+        out["dte"] = target_dte_actual
+
+        try:
+            quote = await self.get_option_quote(
+                symbol=symbol, expiry=target_exp, strike=atm_strike, right="C",
+                timeout_s=timeout_s,
+            )
+            iv = quote.get("iv")
+            if iv is not None and iv > 0:
+                out["iv"] = float(iv)
+        except Exception as e:
+            logger.warning("ATM IV: quote failed for %s %s %s C: %s",
+                           symbol, target_exp, atm_strike, e)
+
+        return out
+
     async def get_market_depth(
         self, *, contract: Any, n_rows: int = 5, timeout_s: float = 4.0,
         is_smart_depth: bool = True,
@@ -639,8 +751,10 @@ class IbkrProvider:
 
         Returns dict with order_id, status, fill snapshot.
         """
-        if self.account_mode != "paper":
-            raise LiveTradingDisabledError()
+        if self.account_mode not in ("paper", "live"):
+            raise ValueError(
+                f"submit_combo: invalid account_mode {self.account_mode!r}"
+            )
         from ib_insync import Bag, ComboLeg, LimitOrder  # type: ignore
 
         ib = await self._ensure_connected()
@@ -829,8 +943,20 @@ class IbkrProvider:
         return list(bars or [])
 
     async def submit_trade(self, intent: TradeIntent) -> dict[str, Any]:
-        if intent.account_mode != "paper" or self.account_mode != "paper":
-            raise LiveTradingDisabledError()
+        # Account-mode consistency: the intent's mode must match the
+        # provider's connection mode. Mixing paper-intent against a live
+        # connection (or vice versa) is operator error.
+        if intent.account_mode != self.account_mode:
+            raise ProviderError(
+                "ibkr",
+                f"account_mode mismatch: intent={intent.account_mode!r} "
+                f"provider={self.account_mode!r}",
+                retryable=False,
+            )
+        if self.account_mode not in ("paper", "live"):
+            raise ValueError(
+                f"submit_trade: invalid account_mode {self.account_mode!r}"
+            )
         if intent.qty <= 0:
             raise ProviderError("ibkr", "qty must be positive")
         from ib_insync import (  # type: ignore

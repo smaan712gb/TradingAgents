@@ -19,9 +19,11 @@ trip simultaneously. Indicators currently wired:
   * Analyst upgrade-after-run — at least one analyst upgrade in the
     last 7 days *while* the stock is up >=25% over 60 days. Late-cycle
     chase pattern. Pre-computed by ``analyst_grades.evaluate_analyst_pressure``.
+  * IV at extreme percentile — front-month ATM call IV at top decile
+    of trailing 252-day distribution OR IV >= 2x 30-day realized vol.
+    Pre-computed by ``iv_signal.evaluate_iv_signal``.
 
 Indicators in the operator spec that the system doesn't yet wire:
-  * Short-term call IV at extreme percentile  — needs IV history
   * Social sentiment euphoria                 — needs sentiment feed
 
 The decision gracefully ignores missing inputs; the threshold is "X of
@@ -71,6 +73,7 @@ def evaluate_momentum_exhaustion(
     auction_price: Optional[float] = None,
     insider_pressure: Optional[dict] = None,      # FMP get_insider_sell_pressure result
     analyst_pressure: Optional[Any] = None,        # analyst_grades.GradePressure
+    iv_signal: Optional[Any] = None,               # iv_signal.IvSignal
 ) -> ExhaustionDecision:
     """Score momentum-exhaustion signals; trip when >=50% of available signals fire."""
     available: list[str] = []
@@ -137,6 +140,13 @@ def evaluate_momentum_exhaustion(
                 f"analyst_upgrade_after_run={n_up} upgrade(s) in 7d / +{pct*100:.0f}% / 60d"
             )
 
+    # IV at extreme percentile / IV-vs-realized rich (8th signal).
+    # ``iv_signal`` is iv_signal.IvSignal — exposes both measures + tripped flag.
+    if iv_signal is not None and getattr(iv_signal, "iv_today", None) is not None:
+        available.append("iv_extreme")
+        if getattr(iv_signal, "tripped", False):
+            tripped.append(f"iv_extreme: {getattr(iv_signal, 'rationale', '?')}")
+
     if not available:
         return ExhaustionDecision(reason=f"{symbol}: no momentum indicators available")
 
@@ -164,6 +174,17 @@ def evaluate_momentum_exhaustion(
             "analyst_upgrade_after_run": (
                 getattr(analyst_pressure, "upgrade_after_run", None)
                 if analyst_pressure is not None else None
+            ),
+            "iv_signal": (
+                {
+                    "iv_today": getattr(iv_signal, "iv_today", None),
+                    "realized_30d_ann": getattr(iv_signal, "realized_30d_ann", None),
+                    "iv_vs_realized": getattr(iv_signal, "iv_vs_realized", None),
+                    "iv_percentile": getattr(iv_signal, "iv_percentile", None),
+                    "days_of_history": getattr(iv_signal, "days_of_history", 0),
+                    "tripped": getattr(iv_signal, "tripped", False),
+                }
+                if iv_signal is not None else None
             ),
         },
     )

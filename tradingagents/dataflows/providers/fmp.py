@@ -363,6 +363,26 @@ class FmpProvider:
             raise ProviderError("fmp", body["Error Message"])
         return body if isinstance(body, list) else []
 
+    async def get_recent_insider_trades(
+        self, *, page: int = 0, limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Universe-wide latest insider trades (Form 4 stream).
+
+        Endpoint: /stable/insider-trading/latest. Returns the freshest
+        rows across all US-listed symbols. Caller filters to symbols of
+        interest (typically theme-universe).
+
+        Not cached — caller wants a fresh sweep on each tick (with its
+        own dedup logic).
+        """
+        body = await self._http.get_json(
+            "/stable/insider-trading/latest",
+            params={"page": page, "limit": limit, "apikey": self._api_key},
+        )
+        if isinstance(body, dict) and "Error Message" in body:
+            raise ProviderError("fmp", body["Error Message"])
+        return body if isinstance(body, list) else []
+
     @cached(ttl_s=4 * 3600, namespace="fmp.insider")
     async def _insider_trading_raw(self, symbol: str) -> list[dict[str, Any]]:
         """Form 4 rows from FMP stable. 4-hour cache — insider filings are
