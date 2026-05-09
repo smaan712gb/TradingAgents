@@ -133,13 +133,16 @@ def build_config() -> dict:
     }
 
     # Scorecard layer config — consumed by scorecard/scorers.py + ranker.py.
-    # Per-theme parallelism: DeepSeek V4 has generous rate limits (8000
-    # tokens/sec on Pro, 16000 on Flash) so 4-5 concurrent symbol pipelines
-    # is the sweet spot. Set to 1 if you hit provider rate limits.
+    # Per-theme parallelism: 2 is the sweet spot. DeepSeek's rate limits
+    # are generous, but Polygon Stocks Advanced has burst rate-limits
+    # (different from "unlimited monthly calls") that get hammered when
+    # 5+ analysts probe the chain simultaneously per symbol. 2 concurrent
+    # symbol pipelines doubles throughput vs sequential without melting
+    # Polygon. Override with THEME_CONCURRENCY env if you want to push it.
     try:
-        theme_concurrency = int(os.environ.get("THEME_CONCURRENCY", "5"))
+        theme_concurrency = int(os.environ.get("THEME_CONCURRENCY", "2"))
     except (TypeError, ValueError):
-        theme_concurrency = 5
+        theme_concurrency = 2
     cfg["scorecard"] = {
         "weights": {
             "mtf_setup":         0.40,
