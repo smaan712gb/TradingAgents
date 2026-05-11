@@ -1,4 +1,4 @@
-from typing import Annotated
+from typing import Annotated, Optional
 
 # Import from vendor-specific modules
 from .y_finance import (
@@ -23,6 +23,7 @@ from .alpha_vantage import (
     get_global_news as get_alpha_vantage_global_news,
 )
 from .alpha_vantage_common import AlphaVantageRateLimitError
+from .providers.base import RateLimitError, AuthError, ProviderError
 
 # Configuration and routing logic
 from .config import get_config
@@ -147,6 +148,7 @@ def route_to_vendor(method: str, *args, **kwargs):
         if vendor not in fallback_vendors:
             fallback_vendors.append(vendor)
 
+    last_error: Optional[Exception] = None
     for vendor in fallback_vendors:
         if vendor not in VENDOR_METHODS[method]:
             continue
@@ -156,7 +158,27 @@ def route_to_vendor(method: str, *args, **kwargs):
 
         try:
             return impl_func(*args, **kwargs)
-        except AlphaVantageRateLimitError:
-            continue  # Only rate limits trigger fallback
+        except AlphaVantageRateLimitError as e:
+            # AlphaVantage daily quota exhausted — try next vendor
+            last_error = e
+            continue
+        except (RateLimitError, AuthError) as e:
+            # Polygon / FMP / UW / IBKR rate-limited or unauthenticated —
+            # try next vendor instead of bubbling up. This is the agent-
+            # path equivalent of the maintenance loop's fallback chain.
+            last_error = e
+            continue
+        except ProviderError as e:
+            # Any other provider-level failure (5xx, malformed response,
+            # network timeout that exhausted retries) — try next vendor.
+            last_error = e
+            continue
 
-    raise RuntimeError(f"No available vendor for '{method}'")
+    # All vendors exhausted. Return a descriptive string instead of
+    # raising — analyst tools are called by LangGraph which interprets
+    # an exception as node failure (silently empty report). A string
+    # at least gives the analyst something to write about.
+    msg = f"No data available for '{method}' (all vendors exhausted)"
+    if last_error:
+        msg += f" — last error: {type(last_error).__name__}: {last_error}"
+    return msg

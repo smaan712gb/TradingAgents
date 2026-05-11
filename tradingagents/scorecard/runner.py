@@ -312,23 +312,45 @@ class ThemeRunner:
 
             producer_task = asyncio.create_task(asyncio.to_thread(producer))
 
+            chunk_count = 0
             try:
                 while True:
                     chunk = await queue.get()
                     if chunk is None:
                         break
                     if isinstance(chunk, dict) and "__error__" in chunk:
+                        logger.error(
+                            "Upstream graph.stream raised for %s: %s",
+                            ticker, chunk["__error__"],
+                        )
                         await self._emit(RunEvent(
                             type="error", ticker=ticker,
                             error=str(chunk["__error__"]),
                         ))
                         break
+                    chunk_count += 1
+                    # Log the keys present in each chunk so we can see
+                    # which analysts are actually contributing reports.
+                    keys_with_text = sorted(
+                        k for k, v in chunk.items()
+                        if isinstance(v, str) and v.strip()
+                    )
+                    logger.debug(
+                        "Ticker %s chunk #%d: text keys=%s",
+                        ticker, chunk_count, keys_with_text or "(none)",
+                    )
                     last_state.update(chunk)
                     await self._emit_state_progress(
                         ticker, chunk, emitted_started, emitted_finished,
                     )
             finally:
                 await producer_task
+            if chunk_count == 0:
+                logger.warning(
+                    "Ticker %s: graph.stream() yielded zero chunks — the "
+                    "upstream pipeline likely failed before any analyst ran",
+                    ticker,
+                )
 
         await stream_loop()
 
@@ -341,6 +363,48 @@ class ThemeRunner:
                 summary="(no report text emitted)",
             ))
             emitted_finished.add(agent_id)
+
+        # End-of-stream diagnostic — if the upstream LangGraph silently
+        # produced no analyst reports (graph.stream returned no chunks, or
+        # chunks didn't carry the report-key state), surface the gap as
+        # explicit warnings per missing agent. Without this, the scorer
+        # gets empty inputs and falls back to theme-only scoring while
+        # the operator has no idea why the per-stock analyst panels are
+        # blank on the run page.
+        missing_analysts = [
+            (agent_id, key) for agent_id, key in AGENT_REPORT_KEY.items()
+            if not (last_state.get(key) or "").strip()
+        ]
+        if missing_analysts:
+            agent_ids = [a for a, _ in missing_analysts]
+            logger.warning(
+                "Ticker %s: upstream graph produced no reports for %s — "
+                "scorer will run with empty inputs (likely a tool/provider "
+                "failure inside the analyst node)",
+                ticker, ", ".join(agent_ids),
+            )
+            # Emit a started+finished pair per missing analyst so the run
+            # page shows them as "Done" with the actual reason, not as
+            # "Idle" forever (which would leave the operator wondering).
+            for agent_id, key in missing_analysts:
+                if agent_id in emitted_finished:
+                    continue
+                if agent_id not in emitted_started:
+                    emitted_started.add(agent_id)
+                    await self._emit(RunEvent(
+                        type="agent_started", agent_id=agent_id, ticker=ticker,
+                    ))
+                emitted_finished.add(agent_id)
+                await self._emit(RunEvent(
+                    type="agent_finished", agent_id=agent_id, ticker=ticker,
+                    summary=(
+                        f"⚠ No {key} produced. Likely cause: an analyst tool "
+                        f"hit a provider error (rate-limit / missing key / "
+                        f"stale chain) and returned empty. Check API logs "
+                        f"around the time of this run for the underlying "
+                        f"failure."
+                    ),
+                ))
 
         # Build the SymbolFinalState the scorer wants.
         sfs = SymbolFinalState.from_upstream(ticker, last_state)
