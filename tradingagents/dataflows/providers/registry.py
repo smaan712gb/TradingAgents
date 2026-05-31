@@ -39,6 +39,7 @@ from .base import (
     OptionsFlowProvider,
     ProviderError,
 )
+from .edgar import EdgarProvider
 from .fmp import FmpProvider
 from .ibkr import IbkrProvider
 from .polygon import PolygonProvider
@@ -62,6 +63,7 @@ _PROVIDER_CTORS: dict[str, Callable[[], Any]] = {
     "fmp":              lambda: FmpProvider(),
     "alphavantage_macro": lambda: AlphaVantageMacroProvider(),
     "ibkr":             lambda: IbkrProvider(),
+    "edgar":            lambda: EdgarProvider(),
 }
 
 

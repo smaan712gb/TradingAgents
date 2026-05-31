@@ -41,6 +41,12 @@ class ExecutionConfig:
     max_offset_pct_of_spread: float = 0.25
     timeout_sec:             float = 300.0  # total budget
     fast_mode:               bool  = False  # used for short-call rolls (faster, wider cap)
+    # Mid-drift abandon threshold. If the combo mid has drifted by more
+    # than this fraction of the *initial* mid since order construction,
+    # abandon rather than chase. 0.05 = 5% drift trips the abandon — for
+    # PMCC combos at $5 net debit, that's 25c (≈ several walk steps' worth
+    # of slippage avoided). Set to None (or <=0) to disable.
+    abandon_on_mid_drift_pct: Optional[float] = 0.05
 
 
 @dataclass
@@ -130,17 +136,22 @@ async def submit_pmcc_combo(
     half_spread = (ask - mid)
 
     # Thin-combo detection: when the half-spread is wide relative to mid,
-    # the default 1¢ step + 0.50 × half_spread cap can't actually walk to
-    # a fillable price within ``cfg.timeout_sec``. For LEAP combos with
-    # 3-6%-of-mid half-spreads (HPE / ANET / AEHR), we adapt:
-    #   * effective cap = max(cfg.max_offset_pct_of_spread, 0.75) — walk
-    #     up to 75% of half-spread above mid (still below ask)
+    # the default 1¢ step can't walk to a fillable price within
+    # ``cfg.timeout_sec``. For LEAP combos with 3-6%-of-mid half-spreads
+    # (HPE / ANET / AEHR), we adapt:
+    #   * effective cap = max(cfg.max_offset_pct_of_spread, 0.50) — walk
+    #     up to half of half-spread above mid (mid + 25% of full spread,
+    #     i.e. a quarter of the way to the ask). The previous override
+    #     value of 0.75 paid 37.5% of full spread above mid — too close
+    #     to the ask for combos with $0.20+ spreads, and unilaterally
+    #     overrode tighter operator caps. 0.50 caps the override at the
+    #     midpoint between mid and ask.
     #   * effective step ≈ 5% of half-spread, so we cover the full
     #     half-spread in ~20 steps without paying through cap
     # Backward compatible: tight combos use the configured cfg values.
     thin_combo = mid > 0 and (half_spread / mid) > 0.03
     if thin_combo:
-        effective_cap_pct = max(cfg.max_offset_pct_of_spread, 0.75)
+        effective_cap_pct = max(cfg.max_offset_pct_of_spread, 0.50)
         effective_step_cents = max(
             cfg.walk_increment_cents,
             int(round((half_spread / 20) * 100)),
@@ -198,12 +209,78 @@ async def submit_pmcc_combo(
         limit = round(mid + direction * cfg.initial_offset_cents / 100.0, 2)
     deadline = t0 + cfg.timeout_sec
     last_trade: Any = None
+    initial_mid = mid          # frozen reference for drift abandon
+    current_mid = mid          # updated each step from a fresh quote
+    drift_threshold = cfg.abandon_on_mid_drift_pct
 
-    def _hit_cap(lim: float) -> bool:
-        return (direction > 0 and lim >= cap) or (direction < 0 and lim <= cap)
+    def _hit_cap(lim: float, cap_ref: float) -> bool:
+        return (direction > 0 and lim >= cap_ref) or (direction < 0 and lim <= cap_ref)
 
     while loop.time() < deadline:
-        if _hit_cap(limit):
+        # Re-quote before each submit so the cap tracks the *current* mid,
+        # not the stale mid we captured at order construction (which can be
+        # 30-60s old after the LEAP+short leg-selection round-trips). This
+        # is the single biggest slippage protection: if the underlying
+        # moves while we walk, the cap moves with it within the drift
+        # tolerance — and if mid drifted too far, we abandon instead of
+        # paying through a stale anchor.
+        if result.walk_steps > 0:
+            try:
+                rq = await ibkr.get_combo_quote(legs=legs, symbol=symbol)
+                rq_mid = rq.get("mid")
+                rq_ask = rq.get("ask")
+                rq_bid = rq.get("bid")
+                if (rq_mid is not None and rq_mid > 0
+                        and rq_ask is not None and rq_bid is not None):
+                    current_mid = rq_mid
+                    # Drift check vs initial mid (BUY: mid moving up is bad
+                    # for us; SELL: mid moving down is bad for us).
+                    if drift_threshold is not None and drift_threshold > 0:
+                        drift_pct = (current_mid - initial_mid) / initial_mid
+                        adverse = (direction > 0 and drift_pct > drift_threshold) \
+                            or (direction < 0 and drift_pct < -drift_threshold)
+                        if adverse:
+                            result.status = "abandoned"
+                            result.error = (
+                                f"mid drifted {drift_pct*100:+.2f}% from "
+                                f"${initial_mid:.2f} → ${current_mid:.2f} "
+                                f"(threshold {drift_threshold*100:.1f}%)"
+                            )
+                            result.audit.append({
+                                "step": result.walk_steps + 1,
+                                "action": "abandon_mid_drift",
+                                "initial_mid": initial_mid, "current_mid": current_mid,
+                                "drift_pct": round(drift_pct, 4),
+                                "ts": datetime.now(timezone.utc).isoformat(),
+                            })
+                            break
+                    # Recompute the cap from the fresh mid + fresh half-spread.
+                    # Don't widen past the initial cap by more than the
+                    # drift_threshold worth — keeps the cap from runaway
+                    # tracking when mid races against us.
+                    new_half = (rq_ask - current_mid) if direction > 0 else (current_mid - rq_bid)
+                    if new_half > 0:
+                        new_cap = round(current_mid + direction * effective_cap_pct * new_half, 2)
+                        if direction > 0:
+                            cap = min(new_cap, cap * (1 + (drift_threshold or 0)))
+                        else:
+                            cap = max(new_cap, cap * (1 - (drift_threshold or 0)))
+                        # Cap-clamp the current limit so we don't sit
+                        # above the freshly-computed ceiling.
+                        if direction > 0 and limit > cap:
+                            limit = cap
+                        elif direction < 0 and limit < cap:
+                            limit = cap
+            except Exception as e:
+                # Re-quote failure is non-fatal: log and walk with the
+                # last known cap. Surface in audit so post-mortems can see.
+                result.audit.append({
+                    "step": result.walk_steps + 1, "action": "requote_failed",
+                    "error": str(e),
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                })
+
+        if _hit_cap(limit, cap):
             limit = cap
 
         result.walk_steps += 1
@@ -223,6 +300,7 @@ async def submit_pmcc_combo(
         result.audit.append({
             "step": result.walk_steps, "action": "submit",
             "limit": limit, "order_id": order_id,
+            "current_mid": current_mid, "cap": cap,
             "ts": datetime.now(timezone.utc).isoformat(),
         })
 
@@ -236,6 +314,9 @@ async def submit_pmcc_combo(
             result.audit.append({
                 "step": result.walk_steps, "action": "filled",
                 "fill_price": result.fill_price,
+                "slippage_vs_initial_mid": round(
+                    direction * (result.fill_price - initial_mid), 4,
+                ),
                 "ts": datetime.now(timezone.utc).isoformat(),
             })
             break
@@ -248,7 +329,7 @@ async def submit_pmcc_combo(
             "ts": datetime.now(timezone.utc).isoformat(),
         })
 
-        if _hit_cap(limit):
+        if _hit_cap(limit, cap):
             # Reached cap and didn't fill — abandon.
             result.status = "abandoned"
             result.error = f"reached cap ${cap} after {result.walk_steps} walk steps"
@@ -266,9 +347,135 @@ async def submit_pmcc_combo(
         if last_trade:
             await _cancel_trade(last_trade)
 
+    # Post-walk reconciliation. The walker tracks fills via the combo
+    # order's status field, but two failure modes can leave us thinking
+    # we abandoned when the broker actually filled:
+    #
+    #   1. Fill-during-cancel race: status polled "not filled", we send
+    #      cancel, broker fills before cancel lands, we move on with the
+    #      walker thinking nothing happened.
+    #
+    #   2. NonGuaranteed leg-by-leg fills: each leg can fill independently
+    #      and the combo's aggregate "filled" field doesn't always reflect
+    #      that — especially when the smart router routes the legs to
+    #      different exchanges.
+    #
+    # Either way the legs end up in the IBKR account while our DB says
+    # the intent abandoned — exactly the state we need to avoid before
+    # going live. Sync the truth: check the leg conids against current
+    # positions; if both are there, override status to "filled".
+    if result.status in ("abandoned", "error"):
+        try:
+            reconciled = await _reconcile_legs_with_positions(
+                ibkr=ibkr, legs=legs, contracts=contracts, action=action,
+            )
+            if reconciled is not None:
+                result.status = "filled"
+                result.fill_price = reconciled["net_price"]
+                result.error = None
+                result.audit.append({
+                    "step": result.walk_steps + 1,
+                    "action": "reconciled_filled_post_walk",
+                    "net_price": reconciled["net_price"],
+                    "leg_costs": reconciled["leg_costs"],
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "note": "walker thought abandoned; positions show filled",
+                })
+                logger.warning(
+                    "walker reconcile: combo for %s actually filled at %.2f "
+                    "(walker had marked %s). Position truth wins.",
+                    symbol, reconciled["net_price"], "abandoned" if result.error is None else "error",
+                )
+        except Exception as e:
+            logger.warning("walker post-walk reconcile failed for %s: %s", symbol, e)
+            result.audit.append({
+                "step": result.walk_steps + 1,
+                "action": "reconcile_error",
+                "error": str(e),
+                "ts": datetime.now(timezone.utc).isoformat(),
+            })
+
     result.finished_at = datetime.now(timezone.utc)
     result.elapsed_sec = loop.time() - t0
     return result
+
+
+async def _reconcile_legs_with_positions(
+    *, ibkr: Any, legs: list[dict[str, Any]], contracts: int, action: str,
+) -> Optional[dict[str, Any]]:
+    """Check if every leg conid is present in IBKR positions at the expected qty.
+
+    Returns ``{"net_price": float, "leg_costs": {conid: avg_cost}}`` if
+    every leg is found with at least ``contracts`` qty (signed by the
+    leg's action). Returns None if any leg is missing — meaning we should
+    trust the walker's "not filled" verdict.
+
+    Sign convention:
+      * combo action=BUY + leg action=BUY  → expect qty >= +contracts
+      * combo action=BUY + leg action=SELL → expect qty <= -contracts
+      * combo action=SELL + leg action=BUY → expect qty <= -contracts (closing)
+      * combo action=SELL + leg action=SELL → expect qty >= +contracts (closing)
+    Combo SELL inverts leg directions because it's the unwind path.
+    """
+    try:
+        ib = await ibkr._ensure_connected()
+    except Exception:
+        return None
+    # ib.positions() is a sync method on the IB instance.
+    try:
+        raw = ib.positions()
+    except Exception:
+        return None
+    if not raw:
+        return None
+    by_conid: dict[int, dict[str, Any]] = {}
+    for p in raw:
+        cid = int(getattr(p.contract, "conId", 0) or 0)
+        if not cid:
+            continue
+        by_conid[cid] = {
+            "qty": float(getattr(p, "position", 0) or 0),
+            "avg_cost": float(getattr(p, "avgCost", 0) or 0),
+            "contract": p.contract,
+        }
+
+    invert = action.upper() == "SELL"
+    leg_costs: dict[int, float] = {}
+    # Net price = sum over legs of (signed avg_cost) divided by multiplier.
+    # For options the avgCost is premium * 100 (the multiplier); we want
+    # per-share/per-contract premium for the net price.
+    signed_premium_sum = 0.0
+    for leg in legs:
+        conid = int(leg["conid"])
+        leg_action = str(leg["action"]).upper()
+        ratio = int(leg.get("ratio", 1))
+        pos = by_conid.get(conid)
+        if pos is None:
+            return None
+        qty = pos["qty"]
+        expected_sign = (+1 if leg_action == "BUY" else -1) * (-1 if invert else +1)
+        expected_qty = expected_sign * ratio * contracts
+        # Be tolerant of partial-fill accumulation from earlier walks —
+        # we just need enough qty in the right direction. ARM example:
+        # leg BUY at +1, we accept qty >= +1.
+        if expected_sign > 0 and qty < expected_qty:
+            return None
+        if expected_sign < 0 and qty > expected_qty:
+            return None
+        leg_costs[conid] = pos["avg_cost"]
+        # Premium contribution: BUY leg adds cost (we paid), SELL leg
+        # subtracts (we received). avgCost is total cost basis per
+        # contract for options (already × multiplier of 100).
+        premium_per_contract = pos["avg_cost"]
+        if leg_action == "BUY":
+            signed_premium_sum += premium_per_contract
+        else:
+            signed_premium_sum -= premium_per_contract
+    # Convert total cost-basis difference to per-share net price (÷ 100 for options).
+    net_price = round(signed_premium_sum / 100.0, 2)
+    if invert:
+        net_price = -net_price   # SELL combos report as credit (positive)
+    return {"net_price": net_price, "leg_costs": leg_costs}
 
 
 # ---------------------------------------------------------------------------

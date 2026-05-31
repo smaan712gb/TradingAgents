@@ -103,12 +103,20 @@ class AsyncHttpClient:
     async def post_json(self, path: str, json: Optional[Mapping[str, Any]] = None) -> Any:
         return await self._request("POST", path, json=json)
 
+    async def get_text(self, path: str, params: Optional[Mapping[str, Any]] = None) -> str:
+        """GET a non-JSON document (XML, HTML, plain text) with the same
+        retry / concurrency / error-translation as get_json. Used for EDGAR
+        filing archives, which serve XML info-tables and HTML cover pages."""
+        resp = await self._request("GET", path, params=params, raw=True)
+        return resp.text  # type: ignore[union-attr]
+
     async def _request(
         self,
         method: str,
         path: str,
         params: Optional[Mapping[str, Any]] = None,
         json: Optional[Mapping[str, Any]] = None,
+        raw: bool = False,
     ) -> Any:
         retry = AsyncRetrying(
             stop=stop_after_attempt(self.cfg.max_retries),
@@ -128,9 +136,31 @@ class AsyncHttpClient:
                 with attempt:
                     async with self._sem:
                         resp = await self._client.request(method, path, params=params, json=json)
+                    # raw=True: status-check only, hand back the response so the
+                    # caller can read .text/.content (XML/HTML documents).
+                    if raw:
+                        self._check_status(resp, path)
+                        return resp
                     return self._parse(resp, path)
         except RetryError as e:  # pragma: no cover
             raise e.last_attempt.exception()  # type: ignore[misc]
+
+    def _check_status(self, resp: httpx.Response, path: str) -> None:
+        if resp.status_code in (401, 403):
+            raise AuthError(self.provider_name)
+        if resp.status_code == 429:
+            retry_after = resp.headers.get("Retry-After")
+            raise RateLimitError(
+                self.provider_name,
+                retry_after_s=float(retry_after) if retry_after else None,
+            )
+        if 500 <= resp.status_code < 600:
+            raise ProviderError(self.provider_name, f"{resp.status_code} on {path}", retryable=True)
+        if resp.status_code >= 400:
+            raise ProviderError(
+                self.provider_name, f"{resp.status_code} on {path}: {resp.text[:200]}",
+                retryable=False,
+            )
 
     def _parse(self, resp: httpx.Response, path: str) -> Any:
         if resp.status_code in (401, 403):

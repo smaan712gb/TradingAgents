@@ -174,6 +174,20 @@ class IbkrProvider:
             except Exception:
                 pass
 
+            # Request delayed-frozen market data as a fallback. IBKR uses
+            # market-data type 1 (live) by default; if the account lacks
+            # the OPRA option-data subscription, live ticks for options
+            # come back empty and our positions API shows last_price ==
+            # avg_price for every option leg. Type 4 (delayed-frozen) is
+            # free and updates every ~15 min, which is enough for the
+            # dashboard's option-leg PnL display. Live ticks for stocks
+            # are unaffected — type 4 only kicks in when live isn't
+            # available for a given contract.
+            try:
+                ib.reqMarketDataType(4)
+            except Exception as e:
+                logger.warning("reqMarketDataType(4) failed: %s", e)
+
             self._ib = ib
             self._reconnect_attempts = 0
             logger.info("ibkr: connected paper account=%s (clientId=%d)",
@@ -277,15 +291,55 @@ class IbkrProvider:
                             break
                 except Exception:
                     pass
+            # Expose enough contract detail so callers can disambiguate
+            # the two-options-with-same-symbol case (PMCC = LEAP + short
+            # call on the same underlying). Without conid/expiry/strike/
+            # right, downstream UI and DB upserts collide on symbol alone.
+            c = p.contract
+            # Normalize price units. IBKR's avgCost on options is
+            # premium × multiplier (cost basis per contract); the ticker's
+            # marketPrice() is premium per share. Mixing them produces
+            # nonsense PnL like $1044 vs $10.44 for the same contract.
+            # Convert to per-share consistently for options so the dashboard
+            # can render with the same fmtMoney helper as stocks.
+            try:
+                mult_int = int(c.multiplier) if c.multiplier else 1
+            except (TypeError, ValueError):
+                mult_int = 100  # standard equity-option multiplier
+            is_option = (c.secType or "").upper() == "OPT"
+            if is_option and mult_int > 0:
+                avg_per_share = avg / mult_int
+                # `last` was sourced from ticker.marketPrice / last / bid /
+                # close — those are already per-share for options. The
+                # fallback path in the loop above assigned last = avg
+                # when no tick arrived, which is per-CONTRACT — detect
+                # that and normalize.
+                if last == avg:
+                    last_per_share = avg_per_share
+                else:
+                    last_per_share = last
+                avg_out = avg_per_share
+                last_out = last_per_share
+                pnl_out = (last_per_share - avg_per_share) * qty * mult_int
+            else:
+                avg_out = avg
+                last_out = last
+                pnl_out = (last - avg) * qty
             out.append({
                 "account_id": p.account,
-                "symbol": p.contract.symbol,
-                "secType": p.contract.secType,
-                "currency": p.contract.currency,
+                "symbol": c.symbol,
+                "secType": c.secType,
+                "currency": c.currency,
                 "qty": qty,
-                "avg_price": round(avg, 4),
-                "last_price": round(last, 4),
-                "pnl": round((last - avg) * qty, 2),
+                "avg_price": round(avg_out, 4),
+                "last_price": round(last_out, 4),
+                "pnl": round(pnl_out, 2),
+                "conid": int(getattr(c, "conId", 0) or 0),
+                "local_symbol": getattr(c, "localSymbol", "") or "",
+                "expiry": getattr(c, "lastTradeDateOrContractMonth", "") or "",
+                "strike": float(getattr(c, "strike", 0) or 0) or None,
+                "right": getattr(c, "right", "") or "",
+                "multiplier": getattr(c, "multiplier", "") or "",
             })
 
         # Drop subscriptions for positions that closed since last call.
@@ -755,7 +809,7 @@ class IbkrProvider:
             raise ValueError(
                 f"submit_combo: invalid account_mode {self.account_mode!r}"
             )
-        from ib_insync import Bag, ComboLeg, LimitOrder  # type: ignore
+        from ib_insync import Bag, ComboLeg, LimitOrder, TagValue  # type: ignore
 
         ib = await self._ensure_connected()
         bag = Bag(
@@ -777,6 +831,13 @@ class IbkrProvider:
             outsideRth=outside_rth,
             tif=tif,
         )
+        # Let IBKR work the order inside the spread (Price Management Algo),
+        # and allow leg-by-leg fills on thin combos via NonGuaranteed Smart
+        # Routing. Without these flags, a bare LMT on a wide-spread BAG often
+        # sits at the original price and times out — the symptom that was
+        # killing our walking-limit fills.
+        order.usePriceMgmtAlgo = True
+        order.smartComboRoutingParams = [TagValue("NonGuaranteed", "1")]
         trade = ib.placeOrder(bag, order)
 
         # Don't block here — the executor wraps placeOrder with the walking
