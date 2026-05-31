@@ -23,7 +23,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Optional
 
@@ -223,6 +223,80 @@ class IbkrProvider:
         ib = await self._ensure_connected()
         rows = await ib.accountSummaryAsync()
         return {r.tag: r.value for r in rows}
+
+    # ------------------------------------------------------------------
+    # News (free with the account's IBKR news-provider subscriptions)
+    # ------------------------------------------------------------------
+
+    async def get_news_providers(self) -> list[dict[str, str]]:
+        """News providers the account is subscribed to (codes used for
+        historical-news queries). Cached per process."""
+        if getattr(self, "_news_providers", None) is None:
+            ib = await self._ensure_connected()
+            try:
+                provs = await ib.reqNewsProvidersAsync()
+                self._news_providers = [{"code": p.code, "name": p.name} for p in provs]
+            except Exception as e:
+                logger.warning("ibkr: reqNewsProviders failed: %s", e)
+                self._news_providers = []
+        return self._news_providers
+
+    async def get_historical_news(
+        self, symbol: str, *, lookback_hours: int = 24,
+        max_results: int = 10, fetch_body: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Recent news for a symbol from the account's subscribed providers.
+
+        Polls reqHistoricalNews (sweep-friendly — no streaming callbacks) and
+        optionally pulls each article body via reqNewsArticle for keyword/LLM
+        analysis. Returns [] when no providers are subscribed or the symbol
+        can't be qualified — never raises into the caller."""
+        from ib_insync import Stock  # type: ignore
+        ib = await self._ensure_connected()
+        try:
+            qualified = await ib.qualifyContractsAsync(Stock(symbol, "SMART", "USD"))
+        except Exception as e:
+            logger.debug("news: qualify failed for %s: %s", symbol, e)
+            return []
+        if not qualified or not getattr(qualified[0], "conId", 0):
+            return []
+        conid = qualified[0].conId
+
+        providers = await self.get_news_providers()
+        if not providers:
+            return []
+        provider_codes = "+".join(p["code"] for p in providers)
+
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(hours=lookback_hours)
+        fmt = "%Y-%m-%d %H:%M:%S.0"   # IBKR historical-news datetime format
+        try:
+            items = await ib.reqHistoricalNewsAsync(
+                conid, provider_codes, start.strftime(fmt), end.strftime(fmt), max_results,
+            )
+        except Exception as e:
+            logger.warning("news: reqHistoricalNews failed for %s: %s", symbol, e)
+            return []
+
+        out: list[dict[str, Any]] = []
+        for it in (items or []):
+            row = {
+                "symbol": symbol,
+                "time": getattr(it, "time", None),
+                "provider": getattr(it, "providerCode", ""),
+                "article_id": getattr(it, "articleId", ""),
+                "headline": getattr(it, "headline", ""),
+                "body": None,
+            }
+            if fetch_body and row["provider"] and row["article_id"]:
+                try:
+                    art = await ib.reqNewsArticleAsync(row["provider"], row["article_id"])
+                    row["body"] = getattr(art, "articleText", None)
+                except Exception as e:
+                    logger.debug("news: article body fetch failed (%s/%s): %s",
+                                 row["provider"], row["article_id"], e)
+            out.append(row)
+        return out
 
     async def get_positions(self) -> list[dict[str, Any]]:
         """Return current account positions with LIVE market data.
