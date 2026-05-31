@@ -123,6 +123,19 @@ class IbkrProvider:
                             self._reconnect_attempts, backoff)
                 await asyncio.sleep(backoff)
 
+            # ib_insync binds its socket via util.getLoop() ==
+            # policy.get_event_loop() (the THREAD-CURRENT loop), not
+            # asyncio.get_running_loop(). Under uvicorn the thread-current
+            # loop is unset/different from the running loop, so the IB socket
+            # ends up attached to a different loop -> "Future attached to a
+            # different loop" the moment we await a request. Pin the
+            # thread-current loop to the running loop so ib_insync uses it.
+            # No-op in a standalone asyncio.run() context.
+            try:
+                asyncio.set_event_loop(asyncio.get_running_loop())
+            except RuntimeError:
+                pass
+
             ib = self._ib_cls()
             try:
                 await ib.connectAsync(
