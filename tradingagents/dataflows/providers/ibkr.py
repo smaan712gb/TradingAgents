@@ -251,8 +251,22 @@ class IbkrProvider:
             if cid in self._pos_subs:
                 continue
             try:
-                ticker = ib.reqMktData(p.contract, "", False, False)
-                self._pos_subs[cid] = (p.contract, ticker)
+                contract = p.contract
+                # Positions come back with no exchange on option legs, and
+                # reqMktData then errors 321 ("please enter exchange"), leaving
+                # option P&L stuck at cost basis. Qualify to fill the exchange;
+                # fall back to SMART (US options route there) if qualify can't.
+                if not getattr(contract, "exchange", None):
+                    try:
+                        q = await ib.qualifyContractsAsync(contract)
+                        if q:
+                            contract = q[0]
+                    except Exception as qe:
+                        logger.debug("qualify failed for %s: %s", contract.symbol, qe)
+                    if not getattr(contract, "exchange", None):
+                        contract.exchange = "SMART"
+                ticker = ib.reqMktData(contract, "", False, False)
+                self._pos_subs[cid] = (contract, ticker)
                 new_subs += 1
             except Exception as e:
                 logger.warning("reqMktData failed for %s: %s", p.contract.symbol, e)
