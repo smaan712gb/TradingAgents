@@ -17,7 +17,9 @@ module owns the *how* (transport, reliability).
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
+import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Mapping, Optional
@@ -60,6 +62,33 @@ class HttpClientConfig:
     user_agent: str = "tradingagents-pro/0.1"
 
 
+@functools.lru_cache(maxsize=1)
+def _default_verify() -> Any:
+    """Resolve the TLS verification setting shared by every provider client.
+
+    Behind a TLS-intercepting corporate proxy (Zscaler & friends), the proxy
+    presents a cert signed by a private root that lives in the *OS* trust
+    store (your browser trusts it) but not in certifi — so httpx's default
+    verification fails on every external host. ``truststore`` makes
+    verification use the OS store, which already trusts that root.
+
+    Returns an ``ssl.SSLContext`` when ``truststore`` is importable, otherwise
+    ``True`` (httpx's certifi default). Never disables verification. Opt out
+    with ``AGENTIC_DISABLE_OS_TRUSTSTORE=1`` to force certifi.
+    """
+    if os.getenv("AGENTIC_DISABLE_OS_TRUSTSTORE", "").lower() in ("1", "true", "yes"):
+        return True
+    try:
+        import ssl
+        import truststore
+        ctx = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        logger.info("http: TLS verification via OS trust store (truststore)")
+        return ctx
+    except Exception as e:  # truststore missing or unusable — keep certifi.
+        logger.debug("http: truststore unavailable (%s); using certifi default", e)
+        return True
+
+
 class AsyncHttpClient:
     """Reusable wrapper around httpx.AsyncClient. Construct once per
     provider, share the underlying connection pool across calls."""
@@ -84,6 +113,7 @@ class AsyncHttpClient:
         self._client = httpx.AsyncClient(
             base_url=base_url,
             http2=http2,
+            verify=_default_verify(),
             timeout=httpx.Timeout(self.cfg.timeout_s, connect=self.cfg.connect_timeout_s),
             headers={
                 "Accept": "application/json",

@@ -30,6 +30,11 @@ dependencies = [
     "tqdm>=4.67.1",
     "typing-extensions>=4.14.0",
     "yfinance>=0.2.63",
+    "httpx>=0.27",
+    "tenacity>=8.2",
+    # Verify TLS against the OS trust store so requests work behind a
+    # corporate TLS-intercepting proxy (e.g. SEC EDGAR from a managed box).
+    "truststore>=0.10",
 ]
 
 [project.scripts]
