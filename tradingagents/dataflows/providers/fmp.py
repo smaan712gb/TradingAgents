@@ -222,6 +222,22 @@ class FmpProvider:
     # ------------------------------------------------------------------
 
     @cached(ttl_s=4 * 3600, namespace="fmp.grades")
+    @cached(ttl_s=7 * 24 * 3600, namespace="fmp.cusip")
+    async def get_cusip(self, symbol: str) -> Optional[str]:
+        """Resolve a ticker's 9-char CUSIP from the company profile.
+
+        Used to bridge 13F holdings (CUSIP-only) to tickers in the
+        hedge-fund tracker. CUSIPs are effectively static, so cache a week.
+        Returns None if the profile has no CUSIP."""
+        body = await self._http.get_json(
+            "/stable/profile", params={"symbol": symbol, "apikey": self._api_key},
+        )
+        if isinstance(body, dict) and "Error Message" in body:
+            raise ProviderError("fmp", body["Error Message"])
+        row = body[0] if isinstance(body, list) and body else (body if isinstance(body, dict) else {})
+        cusip = (row or {}).get("cusip")
+        return str(cusip).upper() if cusip else None
+
     async def get_analyst_grade_changes(self, symbol: str) -> list[dict[str, Any]]:
         """Per-symbol analyst rating changes (upgrades / downgrades / new
         coverage initiations) with prior + new grade and the firm.
