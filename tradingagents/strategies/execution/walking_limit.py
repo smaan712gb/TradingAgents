@@ -680,6 +680,7 @@ async def submit_single_leg_option(
     action: str = "BUY",
     config: Optional[ExecutionConfig] = None,
     fair_value_ceiling: Optional[float] = None,   # don't pay above this (BUY)
+    adaptive_priority: str = "Normal",            # IBKR Adaptive: Patient|Normal|Urgent
 ) -> ExecutionResult:
     """Walk a limit on a SINGLE option leg (used by the LEAPS-only strategy to
     buy a long-dated call outright — no combo, no short leg).
@@ -735,87 +736,49 @@ async def submit_single_leg_option(
         return result
     contract = qc[0]
 
-    def _hit_cap(lim: float) -> bool:
-        return (direction > 0 and lim >= cap) or (direction < 0 and lim <= cap)
-
-    # Aggressive/marketable mode: when the cap is set to the full half-spread
-    # (max_offset_pct_of_spread ~1.0), the cap IS the ask (BUY) / bid (SELL).
-    # Start there so the order is immediately marketable and fills, rather
-    # than resting below the offer (which never fills on a sim and frequently
-    # abandons live). Used for LEAPS entries — for a long-dated thesis the
-    # spread is noise; getting filled at the current price is what matters.
-    if cap_pct >= 0.99:
-        limit = cap
-    else:
-        limit = round(mid + direction * cfg.initial_offset_cents / 100.0, 2)
-        if direction > 0:
-            limit = min(limit, cap)
-        else:
-            limit = max(limit, cap)
+    # ---- Institutional execution: IBKR Adaptive algorithm ------------
+    # A desk doesn't take the ask or rest blind — it works the order. IBKR's
+    # Adaptive algo (IBALGO) steps the price between mid and the limit cap
+    # across venues, seeking a MID-or-better fill. We cap at `cap`
+    # (= mid + cap_pct*half-spread — near mid, the disciplined ceiling), so
+    # we never pay through it, and let Adaptive find price improvement.
+    # Priority: Patient (best price) / Normal (balanced) / Urgent (fast).
+    from ib_insync import Order, TagValue  # type: ignore
     deadline = t0 + cfg.timeout_sec
-    initial_mid = mid
-    drift = cfg.abandon_on_mid_drift_pct
-    trade: Any = None
+    result.submitted_price = cap
+    order = Order(
+        action=action, orderType="LMT", totalQuantity=contracts,
+        lmtPrice=cap, tif="DAY",
+        algoStrategy="Adaptive",
+        algoParams=[TagValue("adaptivePriority", adaptive_priority)],
+    )
+    trade = ib.placeOrder(contract, order)
+    result.order_id = getattr(getattr(trade, "order", None), "orderId", None)
+    result.audit.append({"action": "adaptive_submit", "limit_cap": cap,
+                         "priority": adaptive_priority, "mid": mid, "bid": bid, "ask": ask,
+                         "ts": datetime.now(timezone.utc).isoformat()})
 
+    poll = max(2.0, min(cfg.walk_interval_sec, 5.0))
     while loop.time() < deadline:
-        if result.walk_steps > 0:
-            b, a, m = await _quote()
-            if m and m > 0:
-                if drift and drift > 0:
-                    dp = (m - initial_mid) / initial_mid
-                    if (direction > 0 and dp > drift) or (direction < 0 and dp < -drift):
-                        await _cancel_trade(trade)
-                        result.status = "abandoned"
-                        result.error = f"mid drift {dp*100:+.2f}% (${initial_mid:.2f}->${m:.2f})"
-                        break
-                nh = (a - m) if (a and a > m) else half
-                if nh > 0:
-                    newcap = round(m + direction * cap_pct * nh, 2)
-                    cap = min(newcap, round(cap * (1 + (drift or 0)), 2)) if direction > 0 \
-                        else max(newcap, round(cap * (1 - (drift or 0)), 2))
-                    if (direction > 0 and limit > cap) or (direction < 0 and limit < cap):
-                        limit = cap
-
-        if trade is None:
-            trade = ib.placeOrder(contract, LimitOrder(action, contracts, limit, tif="DAY"))
-        else:
-            trade.order.lmtPrice = limit
-            ib.placeOrder(contract, trade.order)
-        result.walk_steps += 1
-        result.submitted_price = limit
-        result.audit.append({"step": result.walk_steps, "limit": limit, "cap": cap,
-                              "ts": datetime.now(timezone.utc).isoformat()})
-
-        await asyncio.sleep(cfg.walk_interval_sec)
+        await asyncio.sleep(poll)
         st = await _poll_order_status(trade)
-        if st.get("status") == "Filled" or (st.get("filled_qty") and st.get("remaining") == 0):
+        status = st.get("status")
+        if status == "Filled" or (st.get("filled_qty") and st.get("remaining") == 0):
             result.status = "filled"
-            result.fill_price = st.get("avg_fill_price") or limit
+            result.fill_price = st.get("avg_fill_price") or cap
             result.order_id = getattr(getattr(trade, "order", None), "orderId", None)
             break
-        if _hit_cap(limit):
-            # At the cap and still unfilled — give it one more interval, then abandon.
-            await asyncio.sleep(cfg.walk_interval_sec)
-            st = await _poll_order_status(trade)
-            if st.get("status") == "Filled":
-                result.status = "filled"
-                result.fill_price = st.get("avg_fill_price") or limit
-                result.order_id = getattr(getattr(trade, "order", None), "orderId", None)
-            else:
-                await _cancel_trade(trade)
-                result.status = "abandoned"
-                result.error = f"unfilled at cap ${cap}"
+        if status in ("Cancelled", "ApiCancelled", "Inactive"):
+            result.status = "rejected_pretrade"
+            result.error = f"adaptive order {status}"
             break
-        limit = round(limit + direction * max(cfg.walk_increment_cents, 1) / 100.0, 2)
-        if direction > 0:
-            limit = min(limit, cap)
-        else:
-            limit = max(limit, cap)
 
-    if result.status not in ("filled", "abandoned", "rejected_pretrade"):
+    if result.status not in ("filled", "rejected_pretrade"):
+        # Didn't fill within budget at our near-mid cap — cancel + abandon
+        # (the market didn't come to us; re-try next tick rather than chase).
         await _cancel_trade(trade)
         result.status = "abandoned"
-        result.error = result.error or "timeout"
+        result.error = result.error or f"adaptive unfilled by timeout (cap ${cap})"
     result.finished_at = datetime.now(timezone.utc)
     result.elapsed_sec = loop.time() - t0
     return result
