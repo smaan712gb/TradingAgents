@@ -414,6 +414,8 @@ async def _fetch_spot(ibkr: Any, symbol: str) -> Optional[float]:
         end = date.today()
         start = end - timedelta(days=10)
         df = await p.get_stock_data(symbol, start, end)
+        if isinstance(df, str):  # defensive: a corrupted cache hit / error string
+            raise TypeError(f"polygon get_stock_data returned str, not DataFrame: {df[:80]}")
         if df is not None and not df.empty:
             close = float(df["Close"].iloc[-1] if "Close" in df.columns else df["close"].iloc[-1])
             if close > 0:

@@ -690,15 +690,30 @@ class IbkrProvider:
             "dte": None, "spot": None,
         }
 
+        # Process-level negative cache: names with no listed options (e.g.
+        # ADRs like ABBNY) would otherwise re-fail the chain probe on every
+        # IV-snapshot tick. Once we confirm a name isn't optionable, skip it.
+        no_chain = getattr(self, "_iv_no_chain", None)
+        if no_chain is None:
+            no_chain = self._iv_no_chain = set()
+        if symbol in no_chain:
+            return out
+
         try:
             chain = await self.get_option_chain(symbol=symbol)
         except Exception as e:
-            logger.warning("ATM IV: chain fetch failed for %s: %s", symbol, e)
+            msg = str(e).lower()
+            if "no option" in msg or "no security definition" in msg:
+                no_chain.add(symbol)   # not optionable — stop re-probing
+                logger.debug("ATM IV: %s is not optionable — caching skip", symbol)
+            else:
+                logger.warning("ATM IV: chain fetch failed for %s: %s", symbol, e)
             return out
 
         expirations: list[str] = chain.get("expirations") or []
         strikes: list[float] = chain.get("strikes") or []
         if not expirations or not strikes:
+            no_chain.add(symbol)       # confirmed no chain — stop re-probing
             return out
 
         today = _date.today()
@@ -708,13 +723,29 @@ class IbkrProvider:
                 return (ed - today).days
             except Exception:
                 return 99999
+        def _is_monthly(exp: str) -> bool:
+            # Standard monthly = 3rd Friday. Monthlies carry the full strike
+            # ladder; weeklies are sparse, so pairing a weekly expiry with the
+            # nearest-to-spot strike often yields a contract that doesn't exist
+            # (IBKR Error 200). get_option_chain returns the UNION of strikes
+            # and expirations, so we must bias to expirations that actually
+            # list the ATM strike.
+            try:
+                ed = _date(int(exp[:4]), int(exp[4:6]), int(exp[6:8]))
+                return ed.weekday() == 4 and 15 <= ed.day <= 21
+            except Exception:
+                return False
         expirations_with_dte = [(e, _dte_of(e)) for e in expirations]
         # Filter out expired contracts (negative DTE)
         future = [(e, d) for e, d in expirations_with_dte if d > 0]
         if not future:
             return out
-        # Pick the closest DTE to target
-        target_exp, target_dte_actual = min(future, key=lambda ed: abs(ed[1] - target_dte))
+        # Prefer monthly expirations (dense strike ladder); fall back to the
+        # full set only if the name lists no monthlies.
+        monthlies = [(e, d) for e, d in future if _is_monthly(e)]
+        pool = monthlies if monthlies else future
+        # Pick the closest DTE to target within the chosen pool
+        target_exp, target_dte_actual = min(pool, key=lambda ed: abs(ed[1] - target_dte))
 
         # Spot for ATM strike pick
         try:
@@ -725,7 +756,26 @@ class IbkrProvider:
         if not spot or spot <= 0:
             return out
 
-        atm_strike = min(strikes, key=lambda s: abs(s - spot))
+        # Snap the strike to one ACTUALLY listed for the chosen expiry. The
+        # chain's `strikes` is the UNION across all expirations, so the nearest
+        # union strike is frequently not listed on this specific monthly
+        # (e.g. 2.5-increment weeklies) -> IBKR Error 200. Enumerate valid
+        # strikes for (symbol, expiry, C) via reqContractDetails and pick ATM
+        # from those.
+        candidate_strikes = strikes
+        try:
+            from ib_insync import Option  # type: ignore
+            ib = await self._ensure_connected()
+            probe = Option(symbol, target_exp, 0.0, "C", exchange="SMART", currency="USD")
+            details = await ib.reqContractDetailsAsync(probe)
+            exp_strikes = sorted({float(d.contract.strike)
+                                  for d in (details or []) if d.contract.strike})
+            if exp_strikes:
+                candidate_strikes = exp_strikes
+        except Exception as e:
+            logger.debug("ATM IV: per-expiry strike enum failed for %s %s: %s",
+                         symbol, target_exp, e)
+        atm_strike = min(candidate_strikes, key=lambda s: abs(s - spot))
         out["spot"] = spot
         out["strike"] = atm_strike
         out["expiry"] = target_exp

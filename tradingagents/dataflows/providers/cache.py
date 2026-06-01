@@ -25,6 +25,7 @@ import hashlib
 import json
 import logging
 import os
+import pickle
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -181,8 +182,14 @@ def cached(
     ttl_s: int,
     namespace: str,
     *,
-    serialize: Callable[[Any], bytes] = lambda v: json.dumps(v, default=str).encode(),
-    deserialize: Callable[[bytes], Any] = lambda b: json.loads(b.decode()),
+    # Pickle, NOT json.dumps(default=str): the json default silently turns
+    # any non-JSON-native return (pandas DataFrame, frozen dataclasses like
+    # FlowAlert/GammaLevel, Decimal) into its str() repr on write, so the
+    # cache HIT hands back a *string* — e.g. `df.empty` then throws
+    # "'str' object has no attribute 'empty'". Pickle round-trips all of
+    # these losslessly. The cache is our own (Redis/FS), so pickle is safe.
+    serialize: Callable[[Any], bytes] = lambda v: pickle.dumps(v),
+    deserialize: Callable[[bytes], Any] = lambda b: pickle.loads(b),
 ) -> Callable[[Callable[..., Awaitable[T]]], Callable[..., Awaitable[T]]]:
     def decorator(fn: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
         @functools.wraps(fn)
