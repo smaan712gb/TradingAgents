@@ -8,6 +8,7 @@ from .walking_limit import (
     ExecutionConfig,
     ExecutionResult,
     submit_pmcc_combo,
+    submit_single_leg_option,
 )
 
-__all__ = ["ExecutionConfig", "ExecutionResult", "submit_pmcc_combo"]
+__all__ = ["ExecutionConfig", "ExecutionResult", "submit_pmcc_combo", "submit_single_leg_option"]

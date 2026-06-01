@@ -670,3 +670,143 @@ async def _cancel_trade(trade: Any, attempts: int = 2) -> None:
         except Exception as e:
             logger.warning("cancel attempt %d failed: %s", i + 1, e)
             await asyncio.sleep(0.5)
+
+
+async def submit_single_leg_option(
+    *,
+    ibkr: Any,                       # IbkrProvider
+    conid: int,
+    contracts: int,
+    action: str = "BUY",
+    config: Optional[ExecutionConfig] = None,
+    fair_value_ceiling: Optional[float] = None,   # don't pay above this (BUY)
+) -> ExecutionResult:
+    """Walk a limit on a SINGLE option leg (used by the LEAPS-only strategy to
+    buy a long-dated call outright — no combo, no short leg).
+
+    Mirrors ``submit_pmcc_combo``'s discipline at single-leg scale: start near
+    mid, walk toward the ask capped at mid + a bounded fraction of the
+    half-spread, re-quote each step so the cap tracks the live mid, abandon on
+    adverse mid drift or timeout. Quote comes from
+    ``ibkr.get_option_quote_by_conid`` (bid/ask/mid/model_price fallback)."""
+    cfg = config or ExecutionConfig()
+    started = datetime.now(timezone.utc)
+    result = ExecutionResult(status="error", started_at=started)
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+
+    async def _quote() -> tuple[Optional[float], Optional[float], Optional[float]]:
+        q = await ibkr.get_option_quote_by_conid(conid=int(conid))
+        b, a, m = q.get("bid"), q.get("ask"), q.get("mid")
+        if m is None or m <= 0:
+            mp = q.get("model_price")
+            if mp and mp > 0:
+                m = mp
+                b = b if (b and b > 0) else mp
+                a = a if (a and a > 0) else mp
+        return b, a, m
+
+    bid, ask, mid = await _quote()
+    if not mid or mid <= 0:
+        result.status = "rejected_pretrade"
+        result.error = f"no quote for conid={conid}"
+        result.finished_at = datetime.now(timezone.utc)
+        result.elapsed_sec = loop.time() - t0
+        return result
+
+    direction = 1 if action.upper() == "BUY" else -1
+    half = (ask - mid) if (ask and ask > mid) else max(mid * 0.03, 0.05)
+    cap_pct = cfg.max_offset_pct_of_spread
+    if mid > 0 and (half / mid) > 0.03:          # thin option — allow a wider cap
+        cap_pct = max(cap_pct, 0.50)
+    cap = round(mid + direction * cap_pct * half, 2)
+    if direction > 0 and fair_value_ceiling is not None:
+        cap = min(cap, fair_value_ceiling)
+    result.bid_at_submit, result.ask_at_submit, result.mid_at_submit, result.cap_price = bid, ask, mid, cap
+
+    from ib_insync import Contract, LimitOrder  # type: ignore
+    ib = await ibkr._ensure_connected()
+    qc = await ib.qualifyContractsAsync(Contract(conId=int(conid), exchange="SMART", currency="USD"))
+    if not qc:
+        result.status = "error"
+        result.error = f"qualify failed for conid={conid}"
+        result.finished_at = datetime.now(timezone.utc)
+        result.elapsed_sec = loop.time() - t0
+        return result
+    contract = qc[0]
+
+    def _hit_cap(lim: float) -> bool:
+        return (direction > 0 and lim >= cap) or (direction < 0 and lim <= cap)
+
+    limit = round(mid + direction * cfg.initial_offset_cents / 100.0, 2)
+    if direction > 0:
+        limit = min(limit, cap)
+    else:
+        limit = max(limit, cap)
+    deadline = t0 + cfg.timeout_sec
+    initial_mid = mid
+    drift = cfg.abandon_on_mid_drift_pct
+    trade: Any = None
+
+    while loop.time() < deadline:
+        if result.walk_steps > 0:
+            b, a, m = await _quote()
+            if m and m > 0:
+                if drift and drift > 0:
+                    dp = (m - initial_mid) / initial_mid
+                    if (direction > 0 and dp > drift) or (direction < 0 and dp < -drift):
+                        await _cancel_trade(trade)
+                        result.status = "abandoned"
+                        result.error = f"mid drift {dp*100:+.2f}% (${initial_mid:.2f}->${m:.2f})"
+                        break
+                nh = (a - m) if (a and a > m) else half
+                if nh > 0:
+                    newcap = round(m + direction * cap_pct * nh, 2)
+                    cap = min(newcap, round(cap * (1 + (drift or 0)), 2)) if direction > 0 \
+                        else max(newcap, round(cap * (1 - (drift or 0)), 2))
+                    if (direction > 0 and limit > cap) or (direction < 0 and limit < cap):
+                        limit = cap
+
+        if trade is None:
+            trade = ib.placeOrder(contract, LimitOrder(action, contracts, limit, tif="DAY"))
+        else:
+            trade.order.lmtPrice = limit
+            ib.placeOrder(contract, trade.order)
+        result.walk_steps += 1
+        result.submitted_price = limit
+        result.audit.append({"step": result.walk_steps, "limit": limit, "cap": cap,
+                              "ts": datetime.now(timezone.utc).isoformat()})
+
+        await asyncio.sleep(cfg.walk_interval_sec)
+        st = await _poll_order_status(trade)
+        if st.get("status") == "Filled" or (st.get("filled_qty") and st.get("remaining") == 0):
+            result.status = "filled"
+            result.fill_price = st.get("avg_fill_price") or limit
+            result.order_id = getattr(getattr(trade, "order", None), "orderId", None)
+            break
+        if _hit_cap(limit):
+            # At the cap and still unfilled — give it one more interval, then abandon.
+            await asyncio.sleep(cfg.walk_interval_sec)
+            st = await _poll_order_status(trade)
+            if st.get("status") == "Filled":
+                result.status = "filled"
+                result.fill_price = st.get("avg_fill_price") or limit
+                result.order_id = getattr(getattr(trade, "order", None), "orderId", None)
+            else:
+                await _cancel_trade(trade)
+                result.status = "abandoned"
+                result.error = f"unfilled at cap ${cap}"
+            break
+        limit = round(limit + direction * max(cfg.walk_increment_cents, 1) / 100.0, 2)
+        if direction > 0:
+            limit = min(limit, cap)
+        else:
+            limit = max(limit, cap)
+
+    if result.status not in ("filled", "abandoned", "rejected_pretrade"):
+        await _cancel_trade(trade)
+        result.status = "abandoned"
+        result.error = result.error or "timeout"
+    result.finished_at = datetime.now(timezone.utc)
+    result.elapsed_sec = loop.time() - t0
+    return result
