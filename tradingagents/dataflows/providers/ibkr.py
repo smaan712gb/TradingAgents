@@ -187,19 +187,21 @@ class IbkrProvider:
             except Exception:
                 pass
 
-            # Request delayed-frozen market data as a fallback. IBKR uses
-            # market-data type 1 (live) by default; if the account lacks
-            # the OPRA option-data subscription, live ticks for options
-            # come back empty and our positions API shows last_price ==
-            # avg_price for every option leg. Type 4 (delayed-frozen) is
-            # free and updates every ~15 min, which is enough for the
-            # dashboard's option-leg PnL display. Live ticks for stocks
-            # are unaffected — type 4 only kicks in when live isn't
-            # available for a given contract.
+            # Market-data type. Configurable via IBKR_MARKET_DATA_TYPE:
+            #   1 = live (real-time) — REQUIRED for limit orders to be
+            #       marketable + fill; needs a real-time data subscription
+            #       on the account (shared with the paper account).
+            #   3 = delayed (streaming), 4 = delayed-frozen (free, ~15min).
+            # Default 4 (free) so the dashboard shows prices without a
+            # subscription — but delayed prices make limit orders non-
+            # marketable, so the sim won't fill them. Set to 1 once the
+            # real-time subscription is enabled to get fills.
+            md_type = int(os.getenv("IBKR_MARKET_DATA_TYPE", "4") or "4")
             try:
-                ib.reqMarketDataType(4)
+                ib.reqMarketDataType(md_type)
+                logger.info("ibkr: market data type=%d", md_type)
             except Exception as e:
-                logger.warning("reqMarketDataType(4) failed: %s", e)
+                logger.warning("reqMarketDataType(%d) failed: %s", md_type, e)
 
             self._ib = ib
             self._reconnect_attempts = 0
