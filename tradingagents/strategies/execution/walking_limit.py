@@ -738,11 +738,20 @@ async def submit_single_leg_option(
     def _hit_cap(lim: float) -> bool:
         return (direction > 0 and lim >= cap) or (direction < 0 and lim <= cap)
 
-    limit = round(mid + direction * cfg.initial_offset_cents / 100.0, 2)
-    if direction > 0:
-        limit = min(limit, cap)
+    # Aggressive/marketable mode: when the cap is set to the full half-spread
+    # (max_offset_pct_of_spread ~1.0), the cap IS the ask (BUY) / bid (SELL).
+    # Start there so the order is immediately marketable and fills, rather
+    # than resting below the offer (which never fills on a sim and frequently
+    # abandons live). Used for LEAPS entries — for a long-dated thesis the
+    # spread is noise; getting filled at the current price is what matters.
+    if cap_pct >= 0.99:
+        limit = cap
     else:
-        limit = max(limit, cap)
+        limit = round(mid + direction * cfg.initial_offset_cents / 100.0, 2)
+        if direction > 0:
+            limit = min(limit, cap)
+        else:
+            limit = max(limit, cap)
     deadline = t0 + cfg.timeout_sec
     initial_mid = mid
     drift = cfg.abandon_on_mid_drift_pct
