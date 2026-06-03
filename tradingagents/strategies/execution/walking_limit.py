@@ -366,9 +366,21 @@ async def submit_pmcc_combo(
     # positions; if both are there, override status to "filled".
     if result.status in ("abandoned", "error"):
         try:
-            reconciled = await _reconcile_legs_with_positions(
-                ibkr=ibkr, legs=legs, contracts=contracts, action=action,
-            )
+            # The Adaptive/limit order can fill a beat AFTER our cancel
+            # (fill-during-cancel race) or the legs land in positions slightly
+            # late. A single immediate check misses these — so we'd report
+            # "abandoned" and lean on the maintenance-loop reconcile minutes
+            # later (a window where a live position sits unmanaged). Poll a
+            # few times (~30s) so the fill settles and we confirm the truth
+            # HERE. (The maint-loop reconcile remains the backstop beyond 30s.)
+            reconciled = None
+            for _attempt in range(6):
+                reconciled = await _reconcile_legs_with_positions(
+                    ibkr=ibkr, legs=legs, contracts=contracts, action=action,
+                )
+                if reconciled is not None:
+                    break
+                await asyncio.sleep(5)
             if reconciled is not None:
                 result.status = "filled"
                 result.fill_price = reconciled["net_price"]
