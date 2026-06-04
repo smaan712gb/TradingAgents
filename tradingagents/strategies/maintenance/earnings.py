@@ -75,6 +75,52 @@ async def earnings_hedge_due(symbol: str, *, hedge_window_sessions: int = 2) -> 
     return days is not None and 0 <= days <= hedge_window_sessions
 
 
+async def days_since_last_earnings(symbol: str) -> Optional[int]:
+    """Days since the most recent PAST earnings report (0 = reported today),
+    or None if unavailable. Used to detect a fresh post-earnings reaction so an
+    exit trigger can be gated on earnings-proximity rather than raw drawdown."""
+    last = await _fetch_last_earnings(symbol)
+    if last is None:
+        return None
+    return (date.today() - last).days
+
+
+async def _fetch_last_earnings(symbol: str) -> Optional[date]:
+    """Pull the most recent PAST earnings date from FMP. None if unavailable."""
+    try:
+        from tradingagents.dataflows.providers.fmp import FmpProvider
+    except Exception:
+        return None
+    try:
+        p = FmpProvider()
+    except Exception as e:
+        logger.warning("earnings: FMP provider init failed: %s", e)
+        return None
+    try:
+        body = await p._http.get_json(
+            "/stable/earnings-calendar",
+            params={"symbol": symbol, "apikey": p._api_key},
+        )
+        if not isinstance(body, list):
+            return None
+        today = date.today()
+        past = []
+        for row in body:
+            d = row.get("date")
+            if not d:
+                continue
+            try:
+                parsed = date.fromisoformat(str(d)[:10])
+            except (TypeError, ValueError):
+                continue
+            if parsed <= today:
+                past.append(parsed)
+        return max(past) if past else None
+    except Exception as e:
+        logger.warning("earnings: last-earnings fetch failed for %s: %s", symbol, e)
+        return None
+
+
 async def _fetch_next_earnings(symbol: str) -> Optional[date]:
     """Pull the soonest future earnings date from FMP. None if unavailable."""
     try:
