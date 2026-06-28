@@ -1,4 +1,4 @@
-"""Interactive Brokers (IBKR) execution provider — paper-only.
+"""Interactive Brokers (IBKR) execution provider.
 
 Uses `ib_insync` over the TWS/Gateway socket API. The agents NEVER call
 this directly; the FastAPI router accepts a `TradeIntent` from the user
@@ -8,9 +8,13 @@ substitute a fake.
 
 Hard rules in this file:
 
-* `account_mode` must equal `"paper"`. We additionally check that the
-  connected account ID starts with `D` (IBKR's paper-account prefix).
-  Both gates must pass before any order is placed.
+* `account_mode` is `"paper"` or `"live"`. The real-money safety invariant
+  is NOT a flag — it is a runtime check that the *connected account's prefix
+  matches the declared mode*: IBKR paper accounts use a `D` prefix (IB Gateway
+  paper, e.g. `DU1234567`, port 4002) and live real-money accounts use a `U`
+  prefix (port 4001). `verify_account_mode` enforces this on every (re)connect
+  and bails before any order can reach the wrong account. So "paper" against a
+  `U`-account, or "live" against a `D`-account, can never trade.
 * `submit_trade` is the *only* method that places orders. There is no
   market-on-close, no bracket-from-string, no convenience helpers — keep
   the surface area tiny so live trading can never be "almost wired up".
@@ -52,6 +56,38 @@ def _safe_float(v: Any) -> Optional[float]:
 def _safe_int(v: Any) -> Optional[int]:
     f = _safe_float(v)
     return int(f) if f is not None else None
+
+
+def verify_account_mode(account_mode: str, account_id: str) -> None:
+    """Real-money safety invariant: connected account must match declared mode.
+
+    IBKR paper accounts use a 'D' prefix (IB Gateway paper, e.g. DU1234567,
+    port 4002); live real-money accounts use a 'U' prefix (port 4001). A
+    mismatch — paper mode against a U-account, or live mode against a D-account
+    — is operator error and MUST block trading. Enforced on every (re)connect
+    before any order can be placed. Raises ``ProviderError`` on mismatch;
+    returns None when the account is consistent with the mode.
+
+    This is the actual guard that lets us run the live execution path against an
+    IB Gateway PAPER account safely: orders route to the paper account, and a
+    real-money (U) account can never be hit while in paper mode.
+    """
+    if account_mode == "paper" and not account_id.startswith("D"):
+        raise ProviderError(
+            "ibkr",
+            f"IBKR_MODE=paper but connected account {account_id!r} doesn't "
+            f"start with 'D' (paper accounts use D-prefix). Connect to Gateway "
+            f"in paper mode (port 4002) or set IBKR_MODE=live.",
+            retryable=False,
+        )
+    if account_mode == "live" and not account_id.startswith("U"):
+        raise ProviderError(
+            "ibkr",
+            f"IBKR_MODE=live but connected account {account_id!r} doesn't "
+            f"start with 'U' (live accounts use U-prefix). Connect to Gateway "
+            f"in live mode (port 4001) or set IBKR_MODE=paper.",
+            retryable=False,
+        )
 
 
 class IbkrProvider:
@@ -156,30 +192,15 @@ class IbkrProvider:
                 self._reconnect_attempts += 1
                 raise AuthError("ibkr")
             acct = accounts[0]
-            # Account-mode + account-id consistency check. IBKR paper
-            # accounts start with 'D' and live accounts start with 'U'.
-            # Mismatch (paper mode + U-prefix or live mode + D-prefix)
-            # is operator error — bail to prevent unexpected behavior.
-            if self.account_mode == "paper" and not acct.startswith("D"):
+            # Real-money safety invariant: the connected account's prefix must
+            # match the declared mode (paper=D, live=U). Disconnect + bail on
+            # mismatch so an order can never reach the wrong account.
+            try:
+                verify_account_mode(self.account_mode, acct)
+            except ProviderError:
                 try: ib.disconnect()
                 except Exception: pass
-                raise ProviderError(
-                    "ibkr",
-                    f"IBKR_MODE=paper but connected account {acct!r} doesn't "
-                    f"start with 'D' (paper accounts use D-prefix). Connect "
-                    f"to Gateway in paper mode (port 4002) or set IBKR_MODE=live.",
-                    retryable=False,
-                )
-            if self.account_mode == "live" and not acct.startswith("U"):
-                try: ib.disconnect()
-                except Exception: pass
-                raise ProviderError(
-                    "ibkr",
-                    f"IBKR_MODE=live but connected account {acct!r} doesn't "
-                    f"start with 'U' (live accounts use U-prefix). Connect "
-                    f"to Gateway in live mode (port 4001) or set IBKR_MODE=paper.",
-                    retryable=False,
-                )
+                raise
 
             # Wire a disconnect listener so the next call notices and reconnects.
             try:
@@ -205,8 +226,8 @@ class IbkrProvider:
 
             self._ib = ib
             self._reconnect_attempts = 0
-            logger.info("ibkr: connected paper account=%s (clientId=%d)",
-                        acct, self.client_id)
+            logger.info("ibkr: connected %s account=%s (clientId=%d)",
+                        self.account_mode, acct, self.client_id)
             return ib
 
     def _on_disconnect(self) -> None:
