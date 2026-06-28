@@ -381,6 +381,13 @@ class FastThemeRunner:
 
         try:
             context = await self._assemble_ticker_context(ticker)
+            # Quant overlay block (optional) — supplied by the caller per ticker.
+            # These are cross-sectional, point-in-time signals (chokepoint
+            # centrality, smart-money confirmation, dark-pool accumulation,
+            # momentum, flow, manager-archetype lens) with an autonomously
+            # IC-calibrated edge. Factor them into thesis_fit and conviction.
+            quant = (theme.extra_context or {}).get(ticker, "")
+            quant_block = f"\n--- QUANT SIGNALS ---\n{quant}\n" if quant else ""
             user = (
                 f"THEME: {theme.name}\n"
                 f"THESIS: {theme.thesis}\n"
@@ -388,7 +395,10 @@ class FastThemeRunner:
                 f"THEME HEALTH: {health.get('thesis_strength', 'intact')} — "
                 f"{health.get('summary', '')}\n"
                 f"\n--- TICKER DATA ---\n{context}\n"
-                f"\nScore {ticker} against this theme and chokepoint. Output JSON only."
+                f"{quant_block}"
+                f"\nScore {ticker} against this theme and chokepoint. Weigh the "
+                f"QUANT SIGNALS block (when present) into thesis_fit and "
+                f"conviction. Output JSON only."
             )
             data = await self._llm_json(system=_TICKER_SCORE_SYSTEM, user=user)
         except Exception as e:

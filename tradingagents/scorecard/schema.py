@@ -24,6 +24,11 @@ class ThemeInput(BaseModel):
     thesis: str
     chokepoint: str = ""
     tickers: list[str]
+    # Optional per-ticker quant-signal block injected by the caller (Agentic
+    # Edge's quant overlay). The runner stays app-agnostic: it just renders
+    # whatever text it's handed into the per-ticker scoring prompt. Empty by
+    # default so callers that don't supply it are unaffected.
+    extra_context: dict[str, str] = {}
 
 
 class AgentReport(BaseModel):
