@@ -2,9 +2,12 @@
 
 Wraps each data type with a chain of providers. Order is by preference:
 
-  Stock historical bars: Polygon → IBKR → AlphaVantage → FMP → yfinance
-  Sector ETF history:    Polygon → IBKR → AlphaVantage → yfinance
+  Stock historical bars: IBKR → FMP → AlphaVantage → Polygon → yfinance
   Quote / spot:          IBKR → Polygon → yfinance
+
+  IBKR is primary for bars when a live provider is supplied (explicitly, or via
+  set_ibkr_provider_getter) — the operator's paid, broker-authoritative data.
+  FMP is the burst-safe fallback; Polygon is demoted (free tier 429s on bursts).
 
 The fallback triggers on:
   * RateLimitError       — provider's rate limit hit, try next
@@ -35,6 +38,38 @@ logger = logging.getLogger(__name__)
 _FALLBACK_EXCEPTIONS = (RateLimitError, AuthError, ProviderError)
 
 
+# Injectable getter for the live, connected IBKR provider. The host app
+# (Agentic Edge) sets this once at startup via set_ibkr_provider_getter(
+# positions._ibkr) so the fallback can use the operator's PAID, broker-
+# authoritative IBKR data as the PRIMARY bar source EVERYWHERE — including the
+# bulk snapshot/scorecard sweeps that don't thread a provider — without ever
+# opening a second IBKR socket. None => app-agnostic behaviour (IBKR skipped).
+_IBKR_PROVIDER_GETTER: Any = None
+
+
+def set_ibkr_provider_getter(getter: Any) -> None:
+    """Register a callable returning the live connected IbkrProvider."""
+    global _IBKR_PROVIDER_GETTER
+    _IBKR_PROVIDER_GETTER = getter
+
+
+async def _resolve_ibkr(explicit: Any) -> Any:
+    """Explicit provider wins; else the injected getter; else None."""
+    if explicit is not None:
+        return explicit
+    if _IBKR_PROVIDER_GETTER is None:
+        return None
+    try:
+        import inspect
+        prov = _IBKR_PROVIDER_GETTER()
+        if inspect.isawaitable(prov):
+            prov = await prov
+        return prov
+    except Exception as e:
+        logger.debug("ibkr getter unavailable: %s", e)
+        return None
+
+
 async def get_stock_data_with_fallback(
     symbol: str,
     start_date: date,
@@ -42,27 +77,18 @@ async def get_stock_data_with_fallback(
     *,
     ibkr_provider: Any = None,
 ) -> Optional[Any]:
-    """Try Polygon → IBKR → FMP → yfinance for daily bars.
+    """Daily bars via IBKR → FMP → AlphaVantage → Polygon → yfinance.
 
-    Returns a pandas DataFrame with at least 'Close' (and ideally Open / High
-    / Low / Volume) columns, or None if every provider fails.
-
-    ``ibkr_provider`` is optional. When supplied (e.g. the live IbkrProvider
-    instance the maint loop already has), IBKR slots into the chain after
-    Polygon. Otherwise IBKR is skipped.
+    IBKR is the PRIMARY source — the operator's paid, broker-authoritative data
+    — resolved from the explicit arg or the injected live-provider getter. FMP
+    is the burst-safe immediate fallback for when IBKR's historical-data PACING
+    limit is hit on a large universe sweep. Polygon is DEMOTED to a late free
+    fallback (its free tier 429s hard on bursts — the cause of the request
+    storms). Returns a DataFrame with at least 'Close', or None if all fail.
     """
-    # 1. Polygon
-    try:
-        from .providers.polygon import PolygonProvider
-        df = await PolygonProvider().get_stock_data(symbol, start_date, end_date)
-        if df is not None and len(df) > 0:
-            return df
-    except _FALLBACK_EXCEPTIONS as e:
-        logger.warning("polygon get_stock_data failed for %s: %s — falling back", symbol, e)
-    except Exception as e:
-        logger.warning("polygon get_stock_data unexpected error for %s: %s", symbol, e)
+    ibkr_provider = await _resolve_ibkr(ibkr_provider)
 
-    # 2. IBKR (if a connected provider is supplied)
+    # 1. IBKR — primary (paid live data, the broker's own bars)
     if ibkr_provider is not None:
         try:
             df = await _ibkr_to_dataframe(ibkr_provider, symbol, start_date, end_date)
@@ -73,9 +99,18 @@ async def get_stock_data_with_fallback(
         except Exception as e:
             logger.warning("ibkr historical bars unexpected error for %s: %s", symbol, e)
 
-    # 3. AlphaVantage — TIME_SERIES_DAILY_ADJUSTED. Has a generous quota on the
-    # tier the project uses, so it's a sensible cross-vendor sanity step before
-    # we drop down to FMP.
+    # 2. FMP — burst-safe daily EOD; the immediate fallback when IBKR paces out
+    try:
+        from .providers.fmp import FmpProvider
+        df = await _fmp_to_dataframe(FmpProvider(), symbol, start_date, end_date)
+        if df is not None and len(df) > 0:
+            return df
+    except _FALLBACK_EXCEPTIONS as e:
+        logger.warning("fmp historical bars failed for %s: %s — falling back", symbol, e)
+    except Exception as e:
+        logger.warning("fmp historical bars unexpected error for %s: %s", symbol, e)
+
+    # 3. AlphaVantage — TIME_SERIES_DAILY_ADJUSTED, generous quota.
     try:
         df = await _alpha_vantage_to_dataframe(symbol, start_date, end_date)
         if df is not None and len(df) > 0:
@@ -85,18 +120,16 @@ async def get_stock_data_with_fallback(
     except Exception as e:
         logger.warning("alpha_vantage historical bars unexpected error for %s: %s", symbol, e)
 
-    # 4. FMP
+    # 4. Polygon — DEMOTED: free tier rate-limits on bursts; kept as a fallback.
     try:
-        from .providers.fmp import FmpProvider
-        fmp = FmpProvider()
-        df = await _fmp_to_dataframe(fmp, symbol, start_date, end_date)
+        from .providers.polygon import PolygonProvider
+        df = await PolygonProvider().get_stock_data(symbol, start_date, end_date)
         if df is not None and len(df) > 0:
             return df
     except _FALLBACK_EXCEPTIONS as e:
-        logger.warning("fmp historical bars failed for %s: %s — falling back", symbol, e)
+        logger.warning("polygon get_stock_data failed for %s: %s — falling back", symbol, e)
     except Exception as e:
-        logger.warning("fmp historical bars unexpected error for %s: %s", symbol, e)
-
+        logger.warning("polygon get_stock_data unexpected error for %s: %s", symbol, e)
 
     # 5. yfinance — final fallback (no API key required)
     try:
