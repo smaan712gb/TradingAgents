@@ -183,7 +183,14 @@ async def _ibkr_to_dataframe(
         })
     if not rows:
         return None
-    df = pd.DataFrame(rows).set_index("Date")
+    df = pd.DataFrame(rows)
+    # IBKR daily bars carry ``date`` as datetime.date objects, which set_index
+    # leaves as an object-dtype index — comparing that with pd.Timestamp raises
+    # "Cannot compare Timestamp with datetime.date". Coerce to a DatetimeIndex
+    # first so the window filter works (this is why IBKR bars silently errored
+    # and the chain always fell back).
+    df["Date"] = pd.to_datetime(df["Date"])
+    df = df.set_index("Date")
     df = df[(df.index >= pd.Timestamp(start_date)) & (df.index <= pd.Timestamp(end_date))]
     return df
 
