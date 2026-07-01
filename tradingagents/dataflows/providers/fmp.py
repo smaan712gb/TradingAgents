@@ -216,6 +216,91 @@ class FmpProvider:
             ),
         }
 
+    async def get_insider_buy_pressure(
+        self, symbol: str, *, lookback_days: int = 180, usd_floor: float = 200_000,
+    ) -> dict[str, Any]:
+        """Aggregate Form 4 OPPORTUNISTIC BUYS into a clustered-accumulation
+        signal — the bullish mirror of get_insider_sell_pressure.
+
+        The high-conviction shape (per the AI-bottleneck spec): a *cluster* of
+        two or more distinct insiders making OPEN-MARKET purchases with their
+        own capital within ~30 days. Multiple executives adding simultaneously
+        is a strongly bullish, hard-to-fake signal.
+
+        Filters (mirror the sell side, plus opportunistic-only):
+          * Only transaction-code 'P' (open-market purchase). This *excludes*
+            RSU/award vesting (code 'A') and option exercises (code 'M') by
+            construction — i.e. the spec's "exclude 10b5-1 / RSU, keep
+            opportunistic" requirement falls straight out of the code filter.
+          * Officer / director / 10%-owner only (informationally-loaded).
+          * Cluster gate: ``clustered`` requires >=2 distinct buyers in 30d AND
+            a material 30d total (``usd_floor``). A single buyer can be a
+            one-off; a cluster is the signal.
+
+        Returns a dict; ``clustered`` is the boolean accumulation trip flag.
+        """
+        rows = await self._insider_trading_raw(symbol)
+        empty = {
+            "buys_30d_usd": 0.0, "buys_baseline_monthly_usd": 0.0, "ratio": 0.0,
+            "n_buyers_30d": 0, "buyers_30d": [], "clustered": False,
+            "detail": "no opportunistic insider buys in lookback",
+        }
+        if not rows:
+            return empty
+
+        from datetime import date, timedelta
+        today = date.today()
+        cutoff_30d = today - timedelta(days=30)
+        cutoff_180d = today - timedelta(days=lookback_days)
+
+        buys_30d_usd: float = 0.0
+        buys_baseline_usd: float = 0.0
+        buyers_30d: set[str] = set()
+
+        for r in rows:
+            tx_date = _parse_date(r.get("transactionDate") or r.get("filingDate"))
+            if tx_date is None or tx_date < cutoff_180d:
+                continue
+            if not _is_insider_buy(r):
+                continue
+            owner_type = (r.get("typeOfOwner") or "").lower()
+            if not any(k in owner_type for k in ("officer", "director", "10")):
+                continue
+            qty = float(r.get("securitiesTransacted") or 0)
+            price = float(r.get("price") or 0)
+            usd = qty * price
+            if usd <= 0:
+                continue
+            if tx_date >= cutoff_30d:
+                buys_30d_usd += usd
+                buyers_30d.add(str(r.get("reportingName") or r.get("reportingCik") or "?"))
+            else:
+                buys_baseline_usd += usd
+
+        baseline_months = max(1.0, (lookback_days - 30) / 30.0)
+        baseline_monthly = buys_baseline_usd / baseline_months
+        ratio = (buys_30d_usd / baseline_monthly) if baseline_monthly > 0 else 0.0
+
+        # Cluster trip: >=2 distinct opportunistic buyers in 30d AND a material
+        # 30d total. We deliberately do NOT require an acceleration ratio here
+        # (unlike sells): a fresh cluster of buys on a name with little prior
+        # insider buying — exactly the 10x-candidate setup — has no baseline to
+        # accelerate against, so the cluster itself is the signal.
+        clustered = (len(buyers_30d) >= 2 and buys_30d_usd >= usd_floor)
+
+        return {
+            "buys_30d_usd": round(buys_30d_usd, 2),
+            "buys_baseline_monthly_usd": round(baseline_monthly, 2),
+            "ratio": round(ratio, 2),
+            "n_buyers_30d": len(buyers_30d),
+            "buyers_30d": sorted(buyers_30d),
+            "clustered": clustered,
+            "detail": (
+                f"30d=${buys_30d_usd/1e6:.2f}M from {len(buyers_30d)} "
+                f"insider(s) vs baseline ${baseline_monthly/1e6:.2f}M/mo"
+            ),
+        }
+
     # ------------------------------------------------------------------
     # Analyst grades + price targets — feeds the 7th momentum-exhaustion
     # signal ("upgrade after a major run") and the bear research case.
@@ -274,6 +359,47 @@ class FmpProvider:
         if isinstance(body, dict) and "Error Message" in body:
             raise ProviderError("fmp", body["Error Message"])
         return body[0] if isinstance(body, list) and body else {}
+
+    # ------------------------------------------------------------------
+    # Company news — per-symbol article feed. A real news API so the news
+    # sweep (chokepoint + bearish/short lanes) covers the whole theme
+    # universe dynamically, not just whatever IBKR's free feed happens to
+    # carry. Normalised to the sweep's shape: {headline, body, url,
+    # provider, article_id, time}.
+    # ------------------------------------------------------------------
+
+    async def get_stock_news(
+        self, symbol: str, *, limit: int = 20,
+        from_date: Optional[str] = None, to_date: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Recent news for one symbol via ``/stable/news/stock``. Returns rows
+        normalised for run_news_sweep. Raises ProviderError on an API error so
+        the caller can decide (the sweep swallows it per-symbol)."""
+        params: dict[str, Any] = {"symbols": symbol.upper(), "limit": int(limit),
+                                  "apikey": self._api_key}
+        if from_date:
+            params["from"] = from_date
+        if to_date:
+            params["to"] = to_date
+        body = await self._http.get_json("/stable/news/stock", params=params)
+        if isinstance(body, dict) and "Error Message" in body:
+            raise ProviderError("fmp", body["Error Message"])
+        rows = body if isinstance(body, list) else []
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            title = str(r.get("title") or "")
+            url = str(r.get("url") or "")
+            out.append({
+                "headline": title,
+                "body": str(r.get("text") or ""),
+                "url": url,
+                "provider": str(r.get("site") or r.get("publisher") or "fmp")[:24],
+                "article_id": (url or f"{symbol.upper()}:{r.get('publishedDate') or ''}:{title[:40]}")[:64],
+                "time": r.get("publishedDate"),
+            })
+        return out
 
     # ------------------------------------------------------------------
     # 13F institutional ownership — quarterly, feeds exit-pressure as
@@ -516,6 +642,23 @@ def _is_insider_sale(row: dict[str, Any]) -> bool:
     # Exclude clearly non-sale dispositions (gifts, conversions etc.)
     excluded_codes = ("A", "M", "F", "G", "I", "J", "K", "U", "W", "X", "Z")
     if aod == "D" and not any(c in tt for c in excluded_codes):
+        return True
+    return False
+
+
+def _is_insider_buy(row: dict[str, Any]) -> bool:
+    """True only for an OPPORTUNISTIC OPEN-MARKET PURCHASE (Form 4 code 'P').
+
+    This is deliberately strict: code 'P' is a discretionary buy with the
+    insider's own capital. It excludes — by construction — RSU/award vesting
+    (code 'A'), option exercises (code 'M'), gifts (G), and tax dispositions
+    (F). That is exactly the "exclude routine 10b5-1 / RSU, keep opportunistic"
+    filter the accumulation thesis wants, with no extra heuristics needed.
+    """
+    tt = str(row.get("transactionType") or "").upper()
+    # FMP uses forms like "P-Purchase"; match the leading code 'P' but guard
+    # against false hits on words that merely start with P.
+    if tt.startswith("P-") or tt == "P" or "PURCHASE" in tt:
         return True
     return False
 
