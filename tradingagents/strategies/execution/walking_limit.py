@@ -65,6 +65,10 @@ class ExecutionResult:
     cap_price:      Optional[float] = None
     error:          Optional[str] = None
     audit:          list[dict[str, Any]] = field(default_factory=list)
+    # True when an abandoned order's cancellation could NOT be confirmed, so the
+    # resting order may still be live and fill later. Callers must not re-fire a
+    # duplicate against it.
+    order_still_live: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -75,7 +79,7 @@ class ExecutionResult:
             "finished_at": self.finished_at.isoformat() if self.finished_at else None,
             "bid_at_submit": self.bid_at_submit, "ask_at_submit": self.ask_at_submit,
             "mid_at_submit": self.mid_at_submit, "cap_price": self.cap_price,
-            "error": self.error, "audit": self.audit,
+            "error": self.error, "order_still_live": self.order_still_live, "audit": self.audit,
         }
 
 
@@ -288,6 +292,7 @@ async def submit_pmcc_combo(
         try:
             submission = await ibkr.submit_combo(
                 legs=legs, action=action.upper(), net_price=limit, symbol=symbol,
+                contracts=int(contracts),
             )
         except Exception as e:
             result.status = "error"
@@ -322,7 +327,7 @@ async def submit_pmcc_combo(
             break
 
         # Not filled — cancel and walk
-        await _cancel_trade(last_trade)
+        await _cancel_trade(ibkr, last_trade)
         result.audit.append({
             "step": result.walk_steps, "action": "cancel_unfilled",
             "limit": limit,
@@ -345,7 +350,7 @@ async def submit_pmcc_combo(
         result.status = "abandoned"
         result.error = f"timeout after {cfg.timeout_sec}s, {result.walk_steps} steps"
         if last_trade:
-            await _cancel_trade(last_trade)
+            await _cancel_trade(ibkr, last_trade)
 
     # Post-walk reconciliation. The walker tracks fills via the combo
     # order's status field, but two failure modes can leave us thinking
@@ -660,28 +665,42 @@ async def _poll_order_status(trade: Any) -> dict[str, Any]:
         return {"filled_qty": 0, "avg_fill_price": None, "status": "unknown"}
 
 
-async def _cancel_trade(trade: Any, attempts: int = 2) -> None:
-    """Cancel an ib_insync Trade. Tolerates already-filled / already-cancelled."""
-    if trade is None:
-        return
+async def _cancel_trade(ibkr: Any, trade: Any, attempts: int = 3) -> bool:
+    """Cancel an ib_insync Trade through the LIVE IB instance and confirm it is
+    no longer working. Tolerates already-filled / already-cancelled.
+
+    CRITICAL: the previous implementation read ``getattr(trade, "ib", None)``,
+    which is always None (ib_insync Trade has no ``.ib`` attribute), so it was a
+    silent no-op — abandoned/walked orders stayed LIVE at the broker and filled
+    late (the 2026-06-30 GLW incident) and walk steps stacked live orders. We now
+    cancel through ``ibkr._ensure_connected()`` (the same instance that placed
+    the order within a walk) and verify the order reaches a dead state. Returns
+    True if the order is confirmed not-working."""
+    order = getattr(trade, "order", None)
+    if trade is None or order is None:
+        return True
+    _DEAD = {"Cancelled", "ApiCancelled", "Filled", "Inactive"}
     for i in range(attempts):
         try:
-            ib = trade.contract  # placeholder so static type checker doesn't complain
-            ib  # silence
-            from ib_insync import IB  # type: ignore
-            # The Trade carries a reference to the IB instance via its .ib attr in newer
-            # ib_insync versions; older versions need cancellation through the original
-            # ib instance. We try both shapes.
-            ib_inst = getattr(trade, "ib", None)
-            if ib_inst is not None:
-                ib_inst.cancelOrder(trade.order)
-            else:
-                # Fall back: nothing to do, the calling code should pass IB-aware trade
-                logger.debug("trade has no ib ref; cannot cancel")
-            return
+            ib = await ibkr._ensure_connected()
+            # Already terminal? nothing to do.
+            st = str(getattr(getattr(trade, "orderStatus", None), "status", "") or "")
+            if st in _DEAD:
+                return True
+            ib.cancelOrder(order)
+            # Give IBKR a moment to ack, then confirm it's no longer working.
+            for _ in range(6):
+                await asyncio.sleep(0.5)
+                st = str(getattr(getattr(trade, "orderStatus", None), "status", "") or "")
+                if st in _DEAD or st == "PendingCancel":
+                    return True
         except Exception as e:
             logger.warning("cancel attempt %d failed: %s", i + 1, e)
             await asyncio.sleep(0.5)
+    logger.error("could not confirm cancellation of order %s (status=%s) — order may still be LIVE",
+                 getattr(order, "orderId", "?"),
+                 getattr(getattr(trade, "orderStatus", None), "status", "?"))
+    return False
 
 
 async def submit_single_leg_option(
@@ -786,11 +805,33 @@ async def submit_single_leg_option(
             break
 
     if result.status not in ("filled", "rejected_pretrade"):
-        # Didn't fill within budget at our near-mid cap — cancel + abandon
-        # (the market didn't come to us; re-try next tick rather than chase).
-        await _cancel_trade(trade)
-        result.status = "abandoned"
-        result.error = result.error or f"adaptive unfilled by timeout (cap ${cap})"
+        # Didn't fill within budget at our near-mid cap — cancel, then RECONCILE
+        # before declaring abandoned. A fill can land during/after the cancel
+        # (fill-during-cancel race); the combo path already reconciles and the
+        # single-leg path (the primary LEAPS entry AND auto-close/trim executor)
+        # must too, or a filled order gets mis-marked abandoned → unmanaged
+        # position / double-trim on the next tick.
+        cancelled = await _cancel_trade(ibkr, trade)
+        st = await _poll_order_status(trade)
+        if st.get("status") == "Filled" or (st.get("filled_qty") and st.get("remaining") == 0):
+            result.status = "filled"
+            result.fill_price = st.get("avg_fill_price") or cap
+            result.order_id = getattr(getattr(trade, "order", None), "orderId", None)
+            result.audit.append({"action": "reconciled_late_fill",
+                                 "fill_price": result.fill_price,
+                                 "ts": datetime.now(timezone.utc).isoformat()})
+        else:
+            result.status = "abandoned"
+            result.error = result.error or f"adaptive unfilled by timeout (cap ${cap})"
+            if not cancelled:
+                # Cancel could NOT be confirmed — the DAY order may still be live
+                # and fill later. Signal it so the caller does not re-fire a
+                # duplicate (double-trim/over-fill) against a possibly-live order.
+                result.order_still_live = True
+                result.error += " [WARN: cancel unconfirmed — order may still be live]"
+                result.audit.append({"action": "cancel_unconfirmed",
+                                     "order_id": result.order_id,
+                                     "ts": datetime.now(timezone.utc).isoformat()})
     result.finished_at = datetime.now(timezone.utc)
     result.elapsed_sec = loop.time() - t0
     return result

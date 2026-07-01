@@ -122,6 +122,13 @@ class IbkrProvider:
         self._ib: Any = None
         self._connect_lock = asyncio.Lock()
         self._reconnect_attempts = 0
+        # Market-data health: ib_insync's errorEvent records the monotonic time
+        # of the last data-farm refusal (10197 "competing live session" + the
+        # data-farm-down codes). The socket stays UP for these, so the
+        # disconnect listener never fires — the heartbeat watches these instead
+        # and calls force_reconnect() to re-acquire the data farm.
+        self._md_error_at: float = 0.0
+        self._last_force_reconnect: float = 0.0
 
     # ------------------------------------------------------------------
     # Connection lifecycle — single instance, auto-reconnect, listener-driven
@@ -207,6 +214,13 @@ class IbkrProvider:
                 ib.disconnectedEvent += self._on_disconnect
             except Exception:
                 pass
+            # Wire an error listener to catch market-data-farm refusals (10197
+            # "competing live session" etc.) — these leave the socket UP, so the
+            # disconnect path won't fire; the heartbeat reads market_data_unhealthy().
+            try:
+                ib.errorEvent += self._on_error
+            except Exception:
+                pass
 
             # Market-data type. Configurable via IBKR_MARKET_DATA_TYPE:
             #   1 = live (real-time) — REQUIRED for limit orders to be
@@ -221,6 +235,14 @@ class IbkrProvider:
             try:
                 ib.reqMarketDataType(md_type)
                 logger.info("ibkr: market data type=%d", md_type)
+                # REAL MONEY needs LIVE (type 1) data: delayed/frozen prices make
+                # limit orders non-marketable and blind the exit engine to intraday
+                # drawdowns. Scream loudly if a live account is on delayed data.
+                if self.account_mode == "live" and md_type != 1:
+                    logger.critical(
+                        "ibkr: LIVE account on market-data type=%d (NOT live) — limit "
+                        "orders may be non-marketable and exits blind to intraday moves. "
+                        "Set IBKR_MARKET_DATA_TYPE=1.", md_type)
             except Exception as e:
                 logger.warning("reqMarketDataType(%d) failed: %s", md_type, e)
 
@@ -235,6 +257,82 @@ class IbkrProvider:
         next ``_ensure_connected`` call rebuilds the connection."""
         logger.warning("ibkr: disconnect detected, will reconnect on next call")
         self._ib = None
+
+    # Data-farm errors where the socket stays connected but market data is
+    # unavailable: 10197 (competing live session), 1100 (connectivity lost),
+    # 2103/2105/2157 (data-farm connection broken).
+    _MD_FARM_ERROR_CODES = frozenset({10197, 1100, 2103, 2105, 2157})
+    _FORCE_RECONNECT_COOLDOWN = 300.0   # ≥5 min between forced reconnects — never thrash
+
+    def _on_error(self, reqId: Any = None, errorCode: Any = None,
+                  errorString: Any = None, contract: Any = None) -> None:
+        """ib_insync errorEvent handler — stamp the time of data-farm refusals
+        so the heartbeat can trigger an active recovery. Never raises."""
+        try:
+            if int(errorCode) in self._MD_FARM_ERROR_CODES:
+                import time as _t
+                self._md_error_at = _t.monotonic()
+        except Exception:
+            pass
+
+    def market_data_unhealthy(self, window: float = 90.0) -> bool:
+        """True if a data-farm refusal (e.g. 10197) occurred within ``window``
+        seconds. The socket may still report connected — this catches the case
+        the disconnect listener misses."""
+        import time as _t
+        return self._md_error_at > 0.0 and (_t.monotonic() - self._md_error_at) < window
+
+    async def force_reconnect(self, reason: str = "") -> bool:
+        """Tear down and rebuild the connection to re-acquire the market-data
+        farm. For the socket-UP-but-data-refused case (10197) that the
+        disconnect listener never catches. Cooldown-guarded so repeated 10197s
+        can't thrash the connection. Returns True if a reconnect was performed."""
+        import time as _t
+        now = _t.monotonic()
+        if now - self._last_force_reconnect < self._FORCE_RECONNECT_COOLDOWN:
+            return False
+        # SAFETY: never tear down the socket while orders are working — a forced
+        # reconnect orphans the ib_insync Trade handles and the resting orders
+        # become untracked/uncancellable (they can still fill at the broker).
+        # 10197 is a market-DATA problem; if we hold live orders, KEEP the
+        # connection and let quotes degrade to the fallback chain instead.
+        try:
+            if self._ib is not None and self._ib.isConnected():
+                working = [
+                    t for t in self._ib.openTrades()
+                    if str(getattr(getattr(t, "orderStatus", None), "status", "")) in
+                    ("PendingSubmit", "PreSubmitted", "Submitted", "ApiPending", "PendingCancel")
+                ]
+                if working:
+                    logger.warning("ibkr: skipping forced reconnect — %d working order(s) would "
+                                   "be orphaned; keeping connection (data degrades to fallback)",
+                                   len(working))
+                    return False
+        except Exception:
+            pass
+        self._last_force_reconnect = now
+        logger.warning("ibkr: forcing reconnect to recover market data (%s)", reason or "manual")
+        async with self._connect_lock:
+            if self._ib is not None:
+                try:
+                    self._ib.disconnect()
+                except Exception:
+                    pass
+                self._ib = None
+        try:
+            ib = await self._ensure_connected()   # re-acquires its own lock + re-subs the farm
+            # Re-adopt any orders working at the broker into the fresh IB
+            # instance's state so nothing placed pre-reconnect is left untracked.
+            try:
+                await ib.reqAllOpenOrdersAsync()
+            except Exception as e:
+                logger.debug("ibkr: reqAllOpenOrders after reconnect failed: %s", e)
+            self._md_error_at = 0.0
+            logger.info("ibkr: forced reconnect complete — market-data farm re-subscribed")
+            return True
+        except Exception as e:
+            logger.warning("ibkr: forced reconnect failed: %s", e)
+            return False
 
     async def aclose(self) -> None:
         if self._ib is not None:
@@ -397,6 +495,7 @@ class IbkrProvider:
             qty = float(p.position)
             avg = float(p.avgCost)
             last = avg
+            got_tick = False   # did a REAL price arrive, or are we falling back to cost basis?
             sub = self._pos_subs.get(cid)
             if sub is not None:
                 _contract, ticker = sub
@@ -412,6 +511,7 @@ class IbkrProvider:
                         f = _safe_float(v)
                         if f is not None and f > 0:
                             last = f
+                            got_tick = True
                             break
                 except Exception:
                     pass
@@ -457,6 +557,10 @@ class IbkrProvider:
                 "qty": qty,
                 "avg_price": round(avg_out, 4),
                 "last_price": round(last_out, 4),
+                # False when NO live tick arrived and last_price fell back to
+                # cost basis — callers must NOT treat a cost-basis substitution
+                # as a real (flat) price and suppress an exit on it.
+                "price_fresh": bool(got_tick),
                 "pnl": round(pnl_out, 2),
                 "conid": int(getattr(c, "conId", 0) or 0),
                 "local_symbol": getattr(c, "localSymbol", "") or "",
@@ -505,23 +609,54 @@ class IbkrProvider:
         if not qualified:
             raise ProviderError("ibkr", f"could not qualify {symbol} as underlying")
         underlying = qualified[0]
-        params = await ib.reqSecDefOptParamsAsync(
-            underlyingSymbol=underlying.symbol,
-            futFopExchange="",
-            underlyingSecType=underlying.secType,
-            underlyingConId=underlying.conId,
-        )
-        if not params:
-            raise ProviderError("ibkr", f"no option params for {symbol}")
-        # Prefer SMART when present, else first row.
-        choice = next((p for p in params if p.exchange == "SMART"), params[0])
+        # reqSecDefOptParams returns ONE ROW PER EXCHANGE, and each row's
+        # expiration/strike set can differ — a LEAP listed on one exchange may
+        # be absent from another exchange's row. The old code read a SINGLE row
+        # (SMART, else first) and treated it as the whole chain, which silently
+        # dropped expirations for thinner names (e.g. SNDK's Jan-2028 LEAP was
+        # missing from the row read → false "no expirations in window" even
+        # though the contract is real). Take the UNION across ALL rows so
+        # eligibility sees every listed expiration/strike. Retry on an empty
+        # response — the data farm intermittently returns nothing while it's
+        # flapping (the Error 162 / 1100↔1102 farm blips), and a transient
+        # empty must NOT be mistaken for "this name has no options".
+        params = None
+        for attempt in range(3):
+            params = await ib.reqSecDefOptParamsAsync(
+                underlyingSymbol=underlying.symbol,
+                futFopExchange="",
+                underlyingSecType=underlying.secType,
+                underlyingConId=underlying.conId,
+            )
+            if params and any(getattr(p, "expirations", None) for p in params):
+                break
+            if attempt < 2:
+                await asyncio.sleep(1.5)
+        if not params or not any(getattr(p, "expirations", None) for p in params):
+            # retryable=True → the eligibility path treats this as a transient
+            # probe failure to re-attempt next tick, NOT as "no LEAP exists".
+            raise ProviderError("ibkr", f"no option params for {symbol} (empty after retries)",
+                                retryable=True)
+
+        expirations: set[str] = set()
+        strikes: set[float] = set()
+        for p in params:
+            expirations.update(getattr(p, "expirations", None) or [])
+            for s in (getattr(p, "strikes", None) or []):
+                try:
+                    strikes.add(float(s))
+                except (TypeError, ValueError):
+                    continue
+        # SMART (else first) row supplies trading_class / exchange metadata; the
+        # expiration & strike UNION above comes from every row.
+        meta = next((p for p in params if p.exchange == "SMART"), params[0])
         return {
             "underlying_symbol": underlying.symbol,
             "underlying_conid": underlying.conId,
-            "trading_class": choice.tradingClass,
-            "exchange": choice.exchange,
-            "expirations": sorted(list(choice.expirations)),
-            "strikes": sorted([float(s) for s in choice.strikes]),
+            "trading_class": meta.tradingClass,
+            "exchange": meta.exchange,
+            "expirations": sorted(expirations),
+            "strikes": sorted(strikes),
         }
 
     async def get_option_quote(
@@ -962,6 +1097,7 @@ class IbkrProvider:
         action: str = "BUY",        # BUY = pay net debit; SELL = receive net credit
         net_price: float,
         symbol: str,
+        contracts: int = 1,         # number of SPREADS (combos) to trade
         currency: str = "USD",
         outside_rth: bool = False,
         tif: str = "DAY",
@@ -998,9 +1134,15 @@ class IbkrProvider:
                 for leg in legs
             ],
         )
+        # totalQuantity is the number of SPREADS (combos); each leg's per-spread
+        # count is carried by its ComboLeg.ratio. The old code used
+        # legs[0].ratio (always 1) here, so EVERY multi-contract combo/roll
+        # submitted just 1 spread — a 10-lot roll rolled 1 and left 9 in the
+        # old leg while the intent was rewritten as fully rolled. Use `contracts`.
+        n_spreads = max(1, int(contracts))
         order = LimitOrder(
             action=action.upper(),
-            totalQuantity=int(legs[0].get("ratio", 1)),  # qty of "spreads"
+            totalQuantity=n_spreads,
             lmtPrice=round(float(net_price), 2),
             outsideRth=outside_rth,
             tif=tif,
