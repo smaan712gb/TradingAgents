@@ -201,6 +201,92 @@ async def find_new_8k_events(
     return out
 
 
+# EDGAR-direct, CONTENT-GATED filing break detection for HELD names.
+#
+# Two problems this solves that the universe-wide FMP 8-K feed (above) does not:
+#   1. LATENCY — the FMP feed lagged a real WDC 8-K by ~25h (filed on EDGAR
+#      06-03 08:00 ET, FMP surfaced it 06-04). EDGAR is the authoritative,
+#      near-real-time source; for names we HOLD (the ones that can auto-close)
+#      we must not be a day late. So we pull held-name filings straight from
+#      EDGAR each tick.
+#   2. CONTENT — the FMP heuristic flags on TIMING (an after-hours 8-K) without
+#      reading the body, which false-positived a benign WDC convertible-notes
+#      exchange as a thesis-break. Here we fetch the body and run the SAME
+#      keyword-severity engine as earnings transcripts; ONLY a body-confirmed
+#      break (severity >= threshold) is tagged "guidance" and allowed to drive
+#      an auto-close. Everything else is "material_event" (alert only).
+#
+# Covers 8-K (domestic) AND 6-K/20-F (foreign private issuers like TSM/ASML/ARM,
+# which never file 8-K). One list call per held symbol; bodies fetched once and
+# cached by accession, then re-emitted cheaply each tick so a real break keeps
+# re-triggering the close until the position is flat.
+_EDGAR_HELD_FORMS = {"8-K", "8-K/A", "6-K", "6-K/A", "20-F", "20-F/A"}
+_EDGAR_SCAN_CACHE: dict[str, tuple[str, str, str, str, str]] = {}
+
+
+async def find_new_edgar_breaks(
+    *,
+    edgar_provider: Any,
+    held_symbols: set[str],
+    since: Optional[datetime] = None,
+) -> list[FilingEvent]:
+    """EDGAR-direct, content-scored 8-K/6-K/20-F sweep for HELD names.
+
+    Returns FilingEvent objects the maint loop merges into the stream. Events
+    are tagged ``detail["source"]="edgar"``; only those with severity
+    "guidance" (body keyword severity >= break threshold) are eligible to drive
+    an auto-close — the timing-only FMP feed never auto-closes."""
+    if not held_symbols or edgar_provider is None:
+        return []
+    from .earnings_transcript import evaluate_transcript
+
+    cutoff = (since or (datetime.now(timezone.utc) - timedelta(days=5))).date()
+    out: list[FilingEvent] = []
+    for sym in {s.upper() for s in held_symbols}:
+        try:
+            cik = await edgar_provider.lookup_cik_by_ticker(sym)
+        except Exception:
+            cik = None
+        if not cik:
+            continue
+        try:
+            refs = await edgar_provider.list_filings(cik, forms=_EDGAR_HELD_FORMS, since=cutoff)
+        except Exception as e:
+            logger.debug("edgar-break sweep: list_filings failed for %s: %s", sym, e)
+            continue
+        for ref in refs:
+            acc = ref.accession_no
+            if acc in _EDGAR_SCAN_CACHE:
+                severity, rationale, link, fdate, form = _EDGAR_SCAN_CACHE[acc]
+            else:
+                try:
+                    text = await edgar_provider.fetch_filing_text(ref, cik)
+                except Exception:
+                    text = ""
+                sig = evaluate_transcript({"content": text}) if text else None
+                if sig and sig.thesis_break:
+                    severity = "guidance"
+                    rationale = (f"{ref.form} CONTENT break — keyword severity "
+                                 f"{sig.severity_score}: "
+                                 f"{', '.join(m['category'] for m in sig.matches[:5])}")
+                else:
+                    severity = "material_event"
+                    rationale = (f"{ref.form} filed (content severity "
+                                 f"{sig.severity_score if sig else 0}; below break threshold "
+                                 f"— no auto-close)")
+                link = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{ref.accession_nodashes}/"
+                fdate = ref.filed_at.isoformat() if ref.filed_at else ""
+                form = ref.form
+                _EDGAR_SCAN_CACHE[acc] = (severity, rationale, link, fdate, form)
+            out.append(FilingEvent(
+                symbol=sym, filing_date=fdate, accepted_date=fdate,
+                form_type=form, has_financials=False,
+                severity=severity, link=link, final_link=link, rationale=rationale,
+                detail={"source": "edgar"},
+            ))
+    return out
+
+
 def thesis_break_signal_from_filings(
     events: list[FilingEvent],
 ) -> Optional[str]:

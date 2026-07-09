@@ -46,6 +46,11 @@ from ..edgar_parse import (
 
 logger = logging.getLogger(__name__)
 
+# Process-wide ticker->CIK map from SEC company_tickers.json, refreshed daily.
+# Module-level so it survives provider re-instantiation across sweeps.
+_TICKER_CIK_MAP: Optional[dict[str, str]] = None
+_TICKER_CIK_TS: float = 0.0
+
 
 def _cik10(cik: str | int) -> str:
     """Zero-pad a CIK to the 10-digit form data.sec.gov expects."""
@@ -159,6 +164,56 @@ class EdgarProvider:
         # Strip tags cheaply for the regex heuristics.
         text = re.sub(r"<[^>]+>", " ", text)
         return parse_sc13_coverpage(text)
+
+    async def fetch_filing_text(self, ref: FilingRef, cik: str | int, *, max_chars: int = 80_000) -> str:
+        """Return the primary document's text with HTML tags stripped — used by
+        the 6-K/20-F thesis-break watcher to run keyword severity over a foreign
+        private issuer's material-event filing (FPIs file 6-K, never 8-K). Best-
+        effort: empty string if the document can't be located/fetched."""
+        name = ref.primary_document or await self._find_document(
+            cik, ref.accession_nodashes,
+            predicate=lambda n: n.lower().endswith((".htm", ".html", ".txt")),
+        )
+        if not name:
+            return ""
+        try:
+            text = await self._fetch_archive_doc(cik, ref.accession_nodashes, name)
+        except ProviderError:
+            return ""
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text)
+        return text[:max_chars]
+
+    async def lookup_cik_by_ticker(self, ticker: str) -> Optional[str]:
+        """Resolve a CIK (10-digit) from a stock ticker via SEC's canonical
+        ``company_tickers.json`` map. This is what lets us monitor 13D/13G
+        filings BY SUBJECT COMPANY (our holdings + theme universe) rather than
+        only by a hard-coded filer CIK. The map is fetched once and cached for
+        a day (tickers↔CIK rarely change)."""
+        global _TICKER_CIK_MAP, _TICKER_CIK_TS
+        import time
+        sym = ticker.strip().upper()
+        if not sym:
+            return None
+        now = time.time()
+        if _TICKER_CIK_MAP is None or (now - _TICKER_CIK_TS) > 86_400:
+            try:
+                payload = await self._www.get_json("/files/company_tickers.json")
+            except ProviderError as e:
+                logger.warning("edgar: company_tickers fetch failed: %s", e)
+                return _TICKER_CIK_MAP.get(sym) if _TICKER_CIK_MAP else None
+            new_map: dict[str, str] = {}
+            # payload is { "0": {"cik_str": int, "ticker": "AAPL", "title": ...}, ... }
+            rows = payload.values() if isinstance(payload, dict) else []
+            for row in rows:
+                t = str(row.get("ticker") or "").upper()
+                c = row.get("cik_str")
+                if t and c is not None:
+                    new_map[t] = _cik10(c)
+            if new_map:
+                _TICKER_CIK_MAP = new_map
+                _TICKER_CIK_TS = now
+        return (_TICKER_CIK_MAP or {}).get(sym)
 
     async def lookup_cik_by_name(self, company: str) -> Optional[str]:
         """Resolve a CIK from a company name via the legacy company-search

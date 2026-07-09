@@ -275,6 +275,7 @@ async def select_pmcc_legs(
     ibkr: Any,                              # IbkrProvider
     leap_delta_target: float = LEAP_DELTA_TARGET,
     short_delta_target: float = SHORT_DELTA_TARGET,
+    require_short_call: bool = True,
 ) -> PmccEligibility:
     """Build the best PMCC candidate for ``symbol``, or fail eligibility.
 
@@ -286,6 +287,12 @@ async def select_pmcc_legs(
       3. Pick short expirations in the 21–35-day window; same procedure
          for 0.25-delta.
       4. Validate OI / spread / net debit gates.
+
+    ``require_short_call=False`` (LEAPS-only strategy): steps 3-4's short-leg
+    checks are skipped entirely and the candidate carries a zero-value
+    placeholder short leg. A LEAPS-only book never sells the short call, so
+    its OI / spread / delta must never veto an otherwise-eligible LEAP —
+    that dead constraint blocked a top-conviction ALAB entry on 2026-07-09.
     """
     chain = await ibkr.get_option_chain(symbol=symbol)
     expirations = chain["expirations"]
@@ -326,30 +333,36 @@ async def select_pmcc_legs(
         return PmccEligibility(False, reason=f"LEAP spread {leap.spread_pct:.2%} > {LEAP_MAX_SPREAD_PCT:.0%}")
 
     # ---- Short call leg ---------------------------------------------
-    short_exps = _filter_expirations_by_dte(expirations, SHORT_DTE_MIN_DAYS, SHORT_DTE_MAX_DAYS)
-    if not short_exps:
-        return PmccEligibility(False, reason=f"no expirations in {SHORT_DTE_MIN_DAYS}-{SHORT_DTE_MAX_DAYS}d window")
-    target_short_dte = 28
-    short_exps_sorted = sorted(short_exps, key=lambda e: abs(_dte(e) - target_short_dte))[:2]
-    short_strikes = _candidate_short_strikes(spot, strikes)
-    short = await _pick_leg_closest_to_delta(
-        ibkr, symbol, short_exps_sorted, short_strikes, "C",
-        delta_target=short_delta_target, delta_range=SHORT_DELTA_RANGE,
-        spot_for_fallback=spot, moneyness_target=1.10,    # ~10% OTM proxy for 0.25Δ
-    )
-    if short is None:
-        return PmccEligibility(False, reason="no short call within target delta band")
-    if short.open_interest is not None and short.open_interest < SHORT_MIN_OI:
-        return PmccEligibility(False, reason=f"short call OI {short.open_interest} < {SHORT_MIN_OI}")
-    if short.spread_pct is not None and short.spread_pct > SHORT_MAX_SPREAD_PCT:
-        return PmccEligibility(False, reason=f"short call spread {short.spread_pct:.2%} > {SHORT_MAX_SPREAD_PCT:.0%}")
-
-    # Strike sanity: short strike must be > leap strike (otherwise the
-    # combo is effectively a credit spread and the math breaks).
-    if short.strike <= leap.strike:
-        return PmccEligibility(
-            False, reason=f"short strike {short.strike} <= LEAP strike {leap.strike}",
+    if not require_short_call:
+        # LEAPS-only: zero-value placeholder — never quoted, never submitted.
+        # mid resolves to None → short_mid 0 → net debit = the LEAP's mid.
+        short = OptionLeg(expiry=leap.expiry, strike=leap.strike * 100,
+                          right="C", conid=0)
+    else:
+        short_exps = _filter_expirations_by_dte(expirations, SHORT_DTE_MIN_DAYS, SHORT_DTE_MAX_DAYS)
+        if not short_exps:
+            return PmccEligibility(False, reason=f"no expirations in {SHORT_DTE_MIN_DAYS}-{SHORT_DTE_MAX_DAYS}d window")
+        target_short_dte = 28
+        short_exps_sorted = sorted(short_exps, key=lambda e: abs(_dte(e) - target_short_dte))[:2]
+        short_strikes = _candidate_short_strikes(spot, strikes)
+        short = await _pick_leg_closest_to_delta(
+            ibkr, symbol, short_exps_sorted, short_strikes, "C",
+            delta_target=short_delta_target, delta_range=SHORT_DELTA_RANGE,
+            spot_for_fallback=spot, moneyness_target=1.10,    # ~10% OTM proxy for 0.25Δ
         )
+        if short is None:
+            return PmccEligibility(False, reason="no short call within target delta band")
+        if short.open_interest is not None and short.open_interest < SHORT_MIN_OI:
+            return PmccEligibility(False, reason=f"short call OI {short.open_interest} < {SHORT_MIN_OI}")
+        if short.spread_pct is not None and short.spread_pct > SHORT_MAX_SPREAD_PCT:
+            return PmccEligibility(False, reason=f"short call spread {short.spread_pct:.2%} > {SHORT_MAX_SPREAD_PCT:.0%}")
+
+        # Strike sanity: short strike must be > leap strike (otherwise the
+        # combo is effectively a credit spread and the math breaks).
+        if short.strike <= leap.strike:
+            return PmccEligibility(
+                False, reason=f"short strike {short.strike} <= LEAP strike {leap.strike}",
+            )
 
     # ---- Combo financials -------------------------------------------
     leap_mid = leap.mid or 0
@@ -374,12 +387,19 @@ async def select_pmcc_legs(
     notional = (leap.delta or 0.85) * 100 * spot * contracts
 
     leap_delta_str = f"{leap.delta:.2f}" if leap.delta is not None else "—"
-    short_delta_str = f"{short.delta:.2f}" if short.delta is not None else "—"
-    rationale = (
-        f"LEAP ${leap.strike:.0f} {leap.expiry} (Δ≈{leap_delta_str}, mid ${leap_mid:.2f}) "
-        f"+ short ${short.strike:.0f} {short.expiry} (Δ≈{short_delta_str}, mid ${short_mid:.2f}) "
-        f"= net debit ${net_debit:.2f} per spread × {contracts} contracts"
-    )
+    if not require_short_call:
+        rationale = (
+            f"LEAP ${leap.strike:.0f} {leap.expiry} (Δ≈{leap_delta_str}, mid ${leap_mid:.2f}) "
+            f"bought outright (LEAPS-only, no short call) "
+            f"= debit ${net_debit:.2f} per contract × {contracts} contracts"
+        )
+    else:
+        short_delta_str = f"{short.delta:.2f}" if short.delta is not None else "—"
+        rationale = (
+            f"LEAP ${leap.strike:.0f} {leap.expiry} (Δ≈{leap_delta_str}, mid ${leap_mid:.2f}) "
+            f"+ short ${short.strike:.0f} {short.expiry} (Δ≈{short_delta_str}, mid ${short_mid:.2f}) "
+            f"= net debit ${net_debit:.2f} per spread × {contracts} contracts"
+        )
     candidate = PmccCandidate(
         symbol=symbol, spot=spot, contracts=contracts,
         leap=leap, short_call=short,
