@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any, Optional
@@ -68,7 +69,18 @@ LEAP_DTE_TARGET_DAYS        = 21 * 30    # 630d — what we PREFER to hold
 # half-spread and abandons cleanly if it can't fill, so a wide build-
 # time spread is not the same as a wide fill. These thresholds gate
 # the attempt; the executor gates the price.
-LEAP_MIN_OI                 = 50
+# Open interest is a LIQUIDITY hint, not a risk control — the walking-limit
+# executor is what protects the price, and it abandons cleanly rather than
+# paying through its cap. A high floor here rejects the name outright before
+# execution ever gets a say.
+#
+# 50 was rejecting the highest-conviction names in the book: on 2026-08-17 MU
+# (composite 7.8, top of the entire ranking) was refused at OI 23 and SNDK at
+# OI 13. Deep-ITM long-dated contracts legitimately carry thin OI — that is a
+# property of the instrument, not a warning about the name.
+#
+# Env-overridable so this can be tuned without a dependency round-trip.
+LEAP_MIN_OI                 = int(os.getenv("LEAP_MIN_OI", "10"))
 LEAP_MAX_SPREAD_PCT         = 0.30
 
 SHORT_DELTA_TARGET          = 0.25
