@@ -46,8 +46,23 @@ LEAP_DELTA_TARGET           = 0.85
 # doesn't drop us into stock fallback. We'd rather hold a 0.65Δ LEAP that
 # we got filled on than a stock position with no time-decay collection.
 LEAP_DELTA_RANGE            = (0.65, 0.95)
-LEAP_DTE_MIN_DAYS           = 18 * 30
-LEAP_DTE_MAX_DAYS           = 24 * 30
+# DTE window is an ELIGIBILITY band; LEAP_DTE_TARGET_DAYS is what we actually
+# aim for. Keeping them separate matters: the floor used to be 18mo and the
+# target was implicitly the window midpoint, which created a ~6-month annual
+# blackout. US equities list their deepest, most liquid LEAPs on the JANUARY
+# cycle, and January sits outside an 18-24mo window for half the year —
+# e.g. on 2026-08-17: Jan-2028 = 522d (under the 540 floor) and Jan-2029 =
+# 886d (over the 720 ceiling), so NO January series qualified at all. Six
+# top-conviction names (CRDO, ETN, ONTO, TER, AXTI, GEV) were rejected that
+# day as "no expirations in window" — which reads like an unsuitable universe
+# rather than a mis-set constant.
+#
+# The 9-month floor is a FALLBACK for sparse chains, not a new preference:
+# the target below still pulls selection toward ~21mo, so the book keeps its
+# long-dated character and only shortens when nothing longer is listed.
+LEAP_DTE_MIN_DAYS           = 9 * 30     # 270d — eligibility floor (fallback)
+LEAP_DTE_MAX_DAYS           = 24 * 30    # 720d — eligibility ceiling
+LEAP_DTE_TARGET_DAYS        = 21 * 30    # 630d — what we PREFER to hold
 # Eligibility = "is it worth ATTEMPTING a walking-limit fill?" The
 # walking-limit executor caps the actual paid debit at mid + 25% of
 # half-spread and abandons cleanly if it can't fill, so a wide build-
@@ -281,9 +296,10 @@ async def select_pmcc_legs(
 
     Sequence:
       1. Get listed chain (expirations + strikes) from IBKR.
-      2. Pick LEAP expirations in the 18–24mo window; for each, sample
-         strikes near the 0.90-delta target and quote them. Pick the leg
-         closest to target delta within the eligibility band.
+      2. Pick LEAP expirations in the 9–24mo eligibility window, preferring
+         those nearest the ~21mo target; for each, sample strikes near the
+         0.90-delta target and quote them. Pick the leg closest to target
+         delta within the eligibility band.
       3. Pick short expirations in the 21–35-day window; same procedure
          for 0.25-delta.
       4. Validate OI / spread / net debit gates.
@@ -312,8 +328,12 @@ async def select_pmcc_legs(
     leap_exps = _filter_expirations_by_dte(expirations, LEAP_DTE_MIN_DAYS, LEAP_DTE_MAX_DAYS)
     if not leap_exps:
         return PmccEligibility(False, reason=f"no expirations in {LEAP_DTE_MIN_DAYS}-{LEAP_DTE_MAX_DAYS}d window")
-    # Prefer expirations closest to the 21mo midpoint.
-    target_leap_dte = (LEAP_DTE_MIN_DAYS + LEAP_DTE_MAX_DAYS) // 2
+    # Prefer expirations closest to the explicit ~21mo target. Deliberately NOT
+    # the window midpoint: the floor is a sparse-chain fallback, so deriving the
+    # target from it would drag the whole book shorter every time the floor is
+    # widened (270-720 midpoints to 495d / ~16mo — five months shorter, with the
+    # extra theta that implies). Target and floor move independently.
+    target_leap_dte = LEAP_DTE_TARGET_DAYS
     leap_exps_sorted = sorted(leap_exps, key=lambda e: abs(_dte(e) - target_leap_dte))[:2]
     leap_strikes = _candidate_leap_strikes(spot, strikes)
     leap = await _pick_leg_closest_to_delta(

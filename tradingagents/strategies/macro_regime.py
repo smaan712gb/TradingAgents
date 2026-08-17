@@ -58,6 +58,112 @@ class MacroRegime:
     earnings_window_mult: float = 1.0
     rationale: str = ""
     detail: dict[str, Any] = field(default_factory=dict)
+    # True when NEITHER volatility source could be read. The regime then
+    # defaults to 'calm' (sizing_factor 1.0) — i.e. the guardrail is INERT and
+    # full-size entries proceed. Callers must surface this: a blind read that
+    # looks identical to a genuinely calm tape is how a volatility gate silently
+    # stops protecting anything. See _read_vix_spx.
+    degraded: bool = False
+
+
+_FMP_VIX_SYMBOL = "^VIX"
+_FMP_SPX_SYMBOL = "^GSPC"
+
+
+async def _fmp_index_quotes(symbols: list[str]) -> dict[str, dict[str, Any]]:
+    """Batched index quotes via FMP — the vendor-independent volatility fallback.
+
+    Deliberately NOT yfinance: yfinance now routes through curl_cffi, which
+    carries its own CA bundle and ignores the stdlib SSL context, so behind a
+    TLS-intercepting proxy it dies with 'curl (60) SSL certificate problem' even
+    though every other client in the process works. FMP goes over the same httpx
+    stack as the rest of the data layer, so if the system can fetch anything at
+    all it can fetch this.
+
+    Returns {SYMBOL: {last, close, change_pct}} for whatever resolved.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    try:
+        from ..dataflows.providers.fmp import FmpProvider
+        fmp = FmpProvider()
+        try:
+            body = await fmp._http.get_json(
+                "/stable/batch-quote",
+                params={"symbols": ",".join(symbols), "apikey": fmp._api_key},
+            )
+        finally:
+            try:
+                await fmp.aclose()
+            except Exception:  # noqa: BLE001
+                pass
+        for row in (body or []):
+            sym = str(row.get("symbol") or "").upper()
+            if not sym:
+                continue
+            try:
+                last = float(row["price"]) if row.get("price") is not None else None
+            except (TypeError, ValueError, KeyError):
+                last = None
+            chg = row.get("changePercentage", row.get("changesPercentage"))
+            try:
+                # FMP reports percent (-0.368); the rest of this module uses a
+                # fraction (-0.00368). Converting here keeps the classifier's
+                # thresholds in one unit.
+                change_pct = float(chg) / 100.0 if chg is not None else None
+            except (TypeError, ValueError):
+                change_pct = None
+            out[sym] = {"last": last, "close": None, "change_pct": change_pct}
+    except Exception as e:  # noqa: BLE001
+        logger.warning("macro: FMP index-quote fallback failed: %s", e)
+    return out
+
+
+async def _read_vix_spx(ibkr: Any) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
+    """(vix, spx, sources) — broker first, FMP when the broker returns nothing.
+
+    ``get_index_quote`` returns ``{last: None}`` WITHOUT raising when the account
+    lacks a CBOE/CME index subscription. That silent empty is indistinguishable
+    from a calm tape, so the macro guardrail reads 'calm' forever and never cuts
+    size. The fallback must therefore be a genuinely different vendor, not a
+    retry of the same entitlement-gated path.
+
+    ``sources`` records which vendor produced each reading so the audit row and
+    the operator alert can tell "calm" apart from "couldn't see".
+    """
+    empty = {"last": None, "close": None, "change_pct": None}
+    sources: list[str] = []
+    vix: dict[str, Any] = dict(empty)
+    spx: dict[str, Any] = dict(empty)
+
+    try:
+        vix = await ibkr.get_index_quote(symbol="VIX", exchange="CBOE")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("macro: VIX fetch via broker failed: %s", e)
+    try:
+        spx = await ibkr.get_index_quote(symbol="SPX", exchange="CBOE")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("macro: SPX fetch via broker failed: %s", e)
+
+    need: list[str] = []
+    if vix.get("last") is not None:
+        sources.append("vix:broker")
+    else:
+        need.append(_FMP_VIX_SYMBOL)
+    if spx.get("change_pct") is not None:
+        sources.append("spx:broker")
+    else:
+        need.append(_FMP_SPX_SYMBOL)
+
+    if need:
+        quotes = await _fmp_index_quotes(need)
+        if _FMP_VIX_SYMBOL in quotes and quotes[_FMP_VIX_SYMBOL].get("last") is not None:
+            vix = quotes[_FMP_VIX_SYMBOL]
+            sources.append("vix:fmp")
+        if _FMP_SPX_SYMBOL in quotes and quotes[_FMP_SPX_SYMBOL].get("change_pct") is not None:
+            spx = quotes[_FMP_SPX_SYMBOL]
+            sources.append("spx:fmp")
+
+    return vix, spx, sources
 
 
 def _classify_regime(
@@ -95,16 +201,7 @@ async def get_macro_regime(ibkr: Any) -> MacroRegime:
     rest of the system still runs. The audit row records what was
     actually read so operators can see when the fallback fired.
     """
-    vix_q: dict[str, Any] = {"last": None, "close": None, "change_pct": None}
-    spx_q: dict[str, Any] = {"last": None, "close": None, "change_pct": None}
-    try:
-        vix_q = await ibkr.get_index_quote(symbol="VIX", exchange="CBOE")
-    except Exception as e:
-        logger.warning("macro: VIX fetch failed: %s", e)
-    try:
-        spx_q = await ibkr.get_index_quote(symbol="SPX", exchange="CBOE")
-    except Exception as e:
-        logger.warning("macro: SPX fetch failed: %s", e)
+    vix_q, spx_q, sources = await _read_vix_spx(ibkr)
 
     vix_last = vix_q.get("last")
     vix_change = vix_q.get("change_pct")
@@ -121,6 +218,19 @@ async def get_macro_regime(ibkr: Any) -> MacroRegime:
     }[regime]
     leap_roll_deferred = (vix_last is not None and vix_last > VIX_LEAP_ROLL_DEFER)
 
+    # Blind ONLY when neither source produced a volatility read. With no VIX and
+    # no SPX the classifier returns 'calm' -> sizing_factor 1.0, which is
+    # indistinguishable from a genuinely quiet tape: the guardrail is inert and
+    # full-size entries proceed into whatever the market is actually doing.
+    # Flag it loudly so callers can refuse to size on a blind read.
+    degraded = vix_last is None and spx_change is None
+    if degraded:
+        logger.error(
+            "macro: BLIND — no VIX and no SPX from broker or fallback. Regime "
+            "defaults to 'calm' (sizing x1.0), so the volatility guardrail is "
+            "INERT this tick: elevated/defensive/panic can never fire."
+        )
+
     parts: list[str] = []
     if vix_last is not None:
         parts.append(f"VIX {vix_last:.1f}")
@@ -128,7 +238,9 @@ async def get_macro_regime(ibkr: Any) -> MacroRegime:
         parts.append(f"SPX {spx_change*100:+.2f}%")
     rationale = (
         f"macro={regime}"
-        + (f" ({', '.join(parts)})" if parts else " (degraded read; default calm)")
+        + (f" ({', '.join(parts)}"
+           + (f" via {'+'.join(sources)}" if sources else "") + ")"
+           if parts else " (BLIND read — no VIX/SPX from any source; defaulting to calm)")
     )
 
     return MacroRegime(
@@ -139,6 +251,7 @@ async def get_macro_regime(ibkr: Any) -> MacroRegime:
         leap_roll_deferred=leap_roll_deferred,
         earnings_window_mult=earnings_window_mult,
         rationale=rationale,
+        degraded=degraded,
         detail={
             "vix_calm_max": VIX_CALM_MAX,
             "vix_elevated_max": VIX_ELEVATED_MAX,
