@@ -203,6 +203,50 @@ async def _fetch_ohlcv(symbol: str) -> tuple[Optional[list[tuple[str, float, flo
 # ---------------------------------------------------------------------------
 
 
+def _occ_right(contract: str) -> str:
+    """Return "C" or "P" from an OCC option symbol, or "" if unparseable.
+
+    OCC format is root + YYMMDD + C|P + 8-digit strike, e.g.
+
+        NVDA260904C00227500
+                   ^ right, 9 chars from the end
+
+    This used to be `contract.endswith("C")`, which matches nothing: the symbol
+    ends in the STRIKE, not the right. Both the call and put sums were therefore
+    always exactly 0.0, for every symbol, silently — the fetch succeeded, the
+    list was populated, and the totals were zero, so nothing logged an error.
+
+    Measured on NVDA (2026-08-18, 165 live alerts): the correct parse gives
+    $52,866,161 call premium against $9,710,158 put — a decisively bullish
+    tape the system had been reading as no data at all.
+
+    Three consumers were affected, all failing quietly toward "no signal":
+      * flow_tilt was never once "bullish" across the whole universe, so the
+        rotation detector's `bearish > bullish` test was free and
+        flow_distribution tripped on 15 of 17 themes;
+      * flow_imbalance was always None, so z_flow_imbalance carried zero
+        variance and the quant overlay dropped it entirely;
+      * the scorecard's options score sat at its 5.0 neutral default on every
+        idea in the morning report.
+
+    Kept deliberately strict: the right must be exactly where OCC puts it, and
+    anything else returns "" rather than guessing, so a malformed symbol is
+    excluded from both sums instead of being silently counted as a call.
+    """
+    c = (contract or "").strip().upper()
+    # Minimum viable OCC symbol is root(>=1) + YYMMDD(6) + right(1) + strike(8).
+    # Validate the date and strike too, so a fragment like "C00227500" — which
+    # has the right in the correct SLOT but no ticker root — is rejected rather
+    # than silently counted as a call.
+    if len(c) < 16:
+        return ""
+    if c[-9] not in ("C", "P"):
+        return ""
+    if not c[-8:].isdigit() or not c[-15:-9].isdigit():
+        return ""
+    return c[-9]
+
+
 async def _fetch_uw_context(symbol: str) -> UwContext:
     """Pull gamma exposure + recent flow tilt from UW for an ETF.
 
@@ -240,8 +284,10 @@ async def _fetch_uw_context(symbol: str) -> UwContext:
         from datetime import timedelta
         since = datetime.now(timezone.utc) - timedelta(hours=24)
         alerts = await uw.get_options_flow(symbol=symbol, since=since)
-        call_prem = sum(float(a.premium or 0) for a in alerts if a.contract.endswith("C"))
-        put_prem = sum(float(a.premium or 0) for a in alerts if a.contract.endswith("P"))
+        call_prem = sum(float(a.premium or 0) for a in alerts
+                        if _occ_right(a.contract) == "C")
+        put_prem = sum(float(a.premium or 0) for a in alerts
+                       if _occ_right(a.contract) == "P")
         ctx.flow_premium_24h_call = round(call_prem, 0)
         ctx.flow_premium_24h_put = round(put_prem, 0)
         if call_prem > put_prem * 1.5 and call_prem > 250_000:
