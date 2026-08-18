@@ -178,19 +178,91 @@ class UnusualWhalesProvider:
 
     @cached(ttl_s=120, namespace="uw.darkpool")
     async def get_dark_pool_prints(self, symbol: str, since: datetime) -> list[dict[str, Any]]:
-        body = await self._http.get_json(
-            f"/api/stock/{symbol}/dark-pool-prints",
-            params={"limit": 500},
-        )
-        rows = body.get("data") or []
+        """Off-exchange prints for a ticker, newest first, filtered to ``since``.
+
+        The route is ``/api/darkpool/{ticker}``. This previously called
+        ``/api/stock/{ticker}/dark-pool-prints``, which has never existed and
+        returned 404 on every call — so dark-pool data was absent system-wide
+        and ``z_dark_pool_notional`` was silently dropped from the quant overlay
+        as a zero-variance signal.
+
+        Each print is enriched with a SIDE classification derived from the NBBO
+        at execution. Gross off-exchange volume says only that size traded;
+        whether it printed at the offer or the bid is what separates
+        accumulation from distribution:
+
+            at/above ask  -> "buy"    (taker lifted the offer)
+            at/below bid  -> "sell"   (taker hit the bid)
+            inside        -> "mid"    (uninformative)
+
+        ``canceled`` prints are dropped — they are busted trades, not activity.
+        """
+        body = await self._http.get_json(f"/api/darkpool/{symbol}", params={"limit": 500})
+        rows = body.get("data") if isinstance(body, dict) else body
         out: list[dict[str, Any]] = []
-        for r in rows:
+        for r in (rows or []):
+            if not isinstance(r, dict) or r.get("canceled"):
+                continue
             ts = _parse_dt(r.get("executed_at") or r.get("time"))
             if ts is None or ts < since:
                 continue
+
+            def _f(key: str) -> Optional[float]:
+                v = r.get(key)
+                try:
+                    return float(v) if v is not None else None
+                except (TypeError, ValueError):
+                    return None
+
+            price, bid, ask = _f("price"), _f("nbbo_bid"), _f("nbbo_ask")
+            side = "mid"
+            if price is not None and bid is not None and ask is not None and ask >= bid:
+                if price >= ask:
+                    side = "buy"
+                elif price <= bid:
+                    side = "sell"
             r["_ts"] = ts.isoformat()
+            r["_side"] = side
+            r["_price"] = price
+            r["_size"] = _f("size")
+            r["_premium"] = _f("premium")
             out.append(r)
         return out
+
+    async def dark_pool_pressure(self, symbol: str, hours: int = 24) -> dict[str, Any]:
+        """Net off-exchange buying pressure for a symbol over ``hours``.
+
+        Returns signed notional and a normalised -1..+1 imbalance, so the
+        signal expresses DIRECTION rather than gross volume. A name can print
+        enormous off-exchange size while being distributed; only the side tells
+        you which. ``mid`` prints are counted in the total but excluded from the
+        imbalance numerator, since they carry no directional information.
+        """
+        since = datetime.now(tz=timezone.utc) - timedelta(hours=hours)
+        prints = await self.get_dark_pool_prints(symbol, since)
+        buy = sell = mid = 0.0
+        for p in prints:
+            notional = (p.get("_premium")
+                        or ((p.get("_price") or 0.0) * (p.get("_size") or 0.0)))
+            side = p.get("_side")
+            if side == "buy":
+                buy += notional
+            elif side == "sell":
+                sell += notional
+            else:
+                mid += notional
+        directional = buy + sell
+        return {
+            "symbol": symbol.upper(),
+            "n_prints": len(prints),
+            "buy_notional": round(buy, 0),
+            "sell_notional": round(sell, 0),
+            "mid_notional": round(mid, 0),
+            "net_notional": round(buy - sell, 0),
+            "total_notional": round(buy + sell + mid, 0),
+            "imbalance": round((buy - sell) / directional, 4) if directional > 0 else None,
+            "hours": hours,
+        }
 
     # ------------------------------------------------------------------
     # Higher-level helpers — used by the new options-flow analyst.
